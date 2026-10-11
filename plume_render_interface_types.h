@@ -39,6 +39,9 @@ namespace plume {
     typedef HWND RenderWindow;
 #elif defined(__ANDROID__)
     typedef ANativeWindow* RenderWindow;
+#elif defined(__EMSCRIPTEN__)
+    // CSS selector of the canvas, such as "#canvas".
+    typedef const char *RenderWindow;
 #elif defined(PLUME_SDL_VULKAN_ENABLED)
     typedef SDL_Window *RenderWindow;
 #elif defined(__linux__)
@@ -372,7 +375,8 @@ namespace plume {
         UNKNOWN,
         DXIL,
         SPIRV,
-        METAL
+        METAL,
+        WGSL
     };
 
     enum class RenderRaytracingPipelineLibrarySymbolType {

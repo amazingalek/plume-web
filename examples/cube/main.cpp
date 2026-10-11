@@ -21,8 +21,14 @@
 #include "shaders/cubeVert.hlsl.dxil.h"
 #include "shaders/cubeFrag.hlsl.dxil.h"
 #endif
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#include "shaders/cubeVert.hlsl.wgsl.h"
+#include "shaders/cubeFrag.hlsl.wgsl.h"
+#else
 #include "shaders/cubeVert.hlsl.spirv.h"
 #include "shaders/cubeFrag.hlsl.spirv.h"
+#endif
 #ifdef __APPLE__
 #include "shaders/cubeVert.hlsl.metal.h"
 #include "shaders/cubeFrag.hlsl.metal.h"
@@ -31,6 +37,7 @@
 namespace plume {
     extern std::unique_ptr<RenderInterface> CreateMetalInterface();
     extern std::unique_ptr<RenderInterface> CreateD3D12Interface();
+    extern std::unique_ptr<RenderInterface> CreateWebGPUInterface();
     #if PLUME_SDL_VULKAN_ENABLED
     extern std::unique_ptr<RenderInterface> CreateVulkanInterface(RenderWindow sdlWindow);
     #else
@@ -370,10 +377,17 @@ namespace plume {
                 fragmentShader = ctx.m_device->createShader(cubeFragBlobMSL, sizeof(cubeFragBlobMSL), "PSMain", shaderFormat);
                 break;
 #endif
+#ifdef __EMSCRIPTEN__
+            case RenderShaderFormat::WGSL:
+                vertexShader = ctx.m_device->createShader(cubeVertBlobWGSL, sizeof(cubeVertBlobWGSL), "VSMain", shaderFormat);
+                fragmentShader = ctx.m_device->createShader(cubeFragBlobWGSL, sizeof(cubeFragBlobWGSL), "PSMain", shaderFormat);
+                break;
+#else
             case RenderShaderFormat::SPIRV:
                 vertexShader = ctx.m_device->createShader(cubeVertBlobSPIRV, sizeof(cubeVertBlobSPIRV), "VSMain", shaderFormat);
                 fragmentShader = ctx.m_device->createShader(cubeFragBlobSPIRV, sizeof(cubeFragBlobSPIRV), "PSMain", shaderFormat);
                 break;
+#endif
 #ifdef _WIN64
             case RenderShaderFormat::DXIL:
                 vertexShader = ctx.m_device->createShader(cubeVertBlobDXIL, sizeof(cubeVertBlobDXIL), "VSMain", shaderFormat);
@@ -512,7 +526,9 @@ namespace plume {
         SDL_SetWindowTitle(window, windowTitle.c_str());
 
         CubeContext ctx;
-#if PLUME_SDL_VULKAN_ENABLED
+#if defined(__EMSCRIPTEN__)
+        createContext(ctx, renderInterface, "#canvas", apiName);
+#elif PLUME_SDL_VULKAN_ENABLED
         createContext(ctx, renderInterface, window, apiName);
 #elif defined(__linux__)
         SDL_SysWMinfo wmInfo;
@@ -549,6 +565,10 @@ namespace plume {
             }
 
             render(ctx);
+#ifdef __EMSCRIPTEN__
+            // The browser shows the frame once control is back in its event loop.
+            emscripten_sleep(0);
+#endif
         }
 
         // Cleanup
@@ -598,6 +618,9 @@ std::unique_ptr<plume::RenderInterface> CreateRenderInterface(SDL_Window* window
         apiName = "Metal";
         return plume::CreateMetalInterface();
     }
+#elif defined(__EMSCRIPTEN__)
+    apiName = "WebGPU";
+    return plume::CreateWebGPUInterface();
 #else
     apiName = "Vulkan";
 #if PLUME_SDL_VULKAN_ENABLED

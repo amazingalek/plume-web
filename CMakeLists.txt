@@ -45,16 +45,28 @@ if(PLUME_D3D12_AGILITY_SDK_ENABLED)
 endif()
 
 # Print status messages
-message(STATUS "Plume - Building with backends: Vulkan=1 Metal=${APPLE} D3D12=${WIN32}")
+if(EMSCRIPTEN)
+    message(STATUS "Plume - Building with backends: WebGPU=1")
+else()
+    message(STATUS "Plume - Building with backends: Vulkan=1 Metal=${APPLE} D3D12=${WIN32}")
+endif()
 message(STATUS "Plume - SDL Vulkan integration: ${PLUME_SDL_VULKAN_ENABLED}")
 message(STATUS "Plume - D3D12 Agility SDK: ${PLUME_D3D12_AGILITY_SDK_ENABLED}")
 message(STATUS "Plume - Building examples: ${PLUME_BUILD_EXAMPLES}")
 
 # Basic source files that are always included
-set(PLUME_SOURCES
-    plume_vulkan.cpp
-    plume_vulkan.h
-)
+if(EMSCRIPTEN)
+    # The browser has WebGPU only.
+    set(PLUME_SOURCES
+        plume_webgpu.cpp
+        plume_webgpu.h
+    )
+else()
+    set(PLUME_SOURCES
+        plume_vulkan.cpp
+        plume_vulkan.h
+    )
+endif()
 
 # Platform-specific files
 if(APPLE)
@@ -87,6 +99,11 @@ if(WIN32)
     target_include_directories(plume PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/contrib/D3D12MemoryAllocator/include
     )
+endif()
+
+if(EMSCRIPTEN)
+    target_compile_options(plume PUBLIC --use-port=emdawnwebgpu)
+    target_link_options(plume PUBLIC --use-port=emdawnwebgpu)
 endif()
 
 if(PLUME_SDL_VULKAN_ENABLED)

@@ -19,8 +19,14 @@
 #include "shaders/triangleVert.hlsl.dxil.h"
 #include "shaders/triangleFrag.hlsl.dxil.h"
 #endif
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#include "shaders/triangleVert.hlsl.wgsl.h"
+#include "shaders/triangleFrag.hlsl.wgsl.h"
+#else
 #include "shaders/triangleVert.hlsl.spirv.h"
 #include "shaders/triangleFrag.hlsl.spirv.h"
+#endif
 #ifdef __APPLE__
 #include "shaders/triangleVert.hlsl.metal.h"
 #include "shaders/triangleFrag.hlsl.metal.h"
@@ -30,6 +36,7 @@
 namespace plume {
     extern std::unique_ptr<RenderInterface> CreateMetalInterface();
     extern std::unique_ptr<RenderInterface> CreateD3D12Interface();
+    extern std::unique_ptr<RenderInterface> CreateWebGPUInterface();
     #if PLUME_SDL_VULKAN_ENABLED
     extern std::unique_ptr<RenderInterface> CreateVulkanInterface(RenderWindow sdlWindow);
     #else
@@ -102,10 +109,17 @@ namespace plume {
                 fragmentShader = ctx.m_device->createShader(triangleFragBlobMSL, sizeof(triangleFragBlobMSL), "PSMain", shaderFormat);
                 break;
 #endif
+#ifdef __EMSCRIPTEN__
+            case RenderShaderFormat::WGSL:
+                vertexShader = ctx.m_device->createShader(triangleVertBlobWGSL, sizeof(triangleVertBlobWGSL), "VSMain", shaderFormat);
+                fragmentShader = ctx.m_device->createShader(triangleFragBlobWGSL, sizeof(triangleFragBlobWGSL), "PSMain", shaderFormat);
+                break;
+#else
             case RenderShaderFormat::SPIRV:
                 vertexShader = ctx.m_device->createShader(triangleVertBlobSPIRV, sizeof(triangleVertBlobSPIRV), "VSMain", shaderFormat);
                 fragmentShader = ctx.m_device->createShader(triangleFragBlobSPIRV, sizeof(triangleFragBlobSPIRV), "PSMain", shaderFormat);
                 break;
+#endif
 #ifdef _WIN64
             case RenderShaderFormat::DXIL:
                 vertexShader = ctx.m_device->createShader(triangleVertBlobDXIL, sizeof(triangleVertBlobDXIL), "VSMain", shaderFormat);
@@ -298,7 +312,9 @@ namespace plume {
         SDL_SetWindowTitle(window, windowTitle.c_str());
 
         TestContext ctx;
-#if PLUME_SDL_VULKAN_ENABLED
+#if defined(__EMSCRIPTEN__)
+        createContext(ctx, renderInterface, "#canvas", apiName);
+#elif PLUME_SDL_VULKAN_ENABLED
         createContext(ctx, renderInterface, window, apiName);
 #elif defined(__linux__)
         SDL_SysWMinfo wmInfo;
@@ -338,6 +354,10 @@ namespace plume {
             }
 
             render(ctx);
+#ifdef __EMSCRIPTEN__
+            // The browser shows the frame once control is back in its event loop.
+            emscripten_sleep(0);
+#endif
         }
 
         // Transition the active swap chain render target out of the present state to avoid live references to the resource
@@ -388,6 +408,9 @@ std::unique_ptr<plume::RenderInterface> CreateRenderInterface(SDL_Window* window
         apiName = "Metal";
         return plume::CreateMetalInterface();
     }
+#elif defined(__EMSCRIPTEN__)
+    apiName = "WebGPU";
+    return plume::CreateWebGPUInterface();
 #else
     apiName = "Vulkan";
 #if PLUME_SDL_VULKAN_ENABLED

@@ -1,0 +1,2167 @@
+//
+// plume
+//
+// Copyright (c) 2024 renderbag and contributors. All rights reserved.
+// Licensed under the MIT license. See LICENSE file for details.
+//
+
+// The WebGPU backend. plume_webgpu.h says what it does where core WebGPU has no equivalent.
+
+#include "plume_webgpu.h"
+
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
+
+#include <emscripten/html5.h>
+
+namespace plume {
+    static const uint32_t PushConstantsAlignment = 256;
+
+    static WGPUStringView toStringView(const std::string &str) {
+        return { str.c_str(), str.size() };
+    }
+
+    static void warnOnce(bool &warned, const char *message) {
+        if (!warned) {
+            fprintf(stderr, "plume WebGPU: %s\n", message);
+            warned = true;
+        }
+    }
+
+#define PLUME_WEBGPU_UNSUPPORTED(message) do { static bool warned = false; warnOnce(warned, message); } while (0)
+
+    static uint64_t alignUp(uint64_t value, uint64_t alignment) {
+        return (value + alignment - 1) / alignment * alignment;
+    }
+
+    // Conversion functions.
+
+    static WGPUTextureFormat toWGPU(RenderFormat format) {
+        switch (format) {
+        case RenderFormat::UNKNOWN: return WGPUTextureFormat_Undefined;
+        case RenderFormat::R32G32B32A32_TYPELESS:
+        case RenderFormat::R32G32B32A32_FLOAT: return WGPUTextureFormat_RGBA32Float;
+        case RenderFormat::R32G32B32A32_UINT: return WGPUTextureFormat_RGBA32Uint;
+        case RenderFormat::R32G32B32A32_SINT: return WGPUTextureFormat_RGBA32Sint;
+        case RenderFormat::R16G16B16A16_TYPELESS:
+        case RenderFormat::R16G16B16A16_FLOAT: return WGPUTextureFormat_RGBA16Float;
+        case RenderFormat::R16G16B16A16_UNORM: return WGPUTextureFormat_RGBA16Unorm;
+        case RenderFormat::R16G16B16A16_UINT: return WGPUTextureFormat_RGBA16Uint;
+        case RenderFormat::R16G16B16A16_SNORM: return WGPUTextureFormat_RGBA16Snorm;
+        case RenderFormat::R16G16B16A16_SINT: return WGPUTextureFormat_RGBA16Sint;
+        case RenderFormat::R32G32_TYPELESS:
+        case RenderFormat::R32G32_FLOAT: return WGPUTextureFormat_RG32Float;
+        case RenderFormat::R32G32_UINT: return WGPUTextureFormat_RG32Uint;
+        case RenderFormat::R32G32_SINT: return WGPUTextureFormat_RG32Sint;
+        case RenderFormat::R8G8B8A8_TYPELESS:
+        case RenderFormat::R8G8B8A8_UNORM: return WGPUTextureFormat_RGBA8Unorm;
+        case RenderFormat::R8G8B8A8_UINT: return WGPUTextureFormat_RGBA8Uint;
+        case RenderFormat::R8G8B8A8_SNORM: return WGPUTextureFormat_RGBA8Snorm;
+        case RenderFormat::R8G8B8A8_SINT: return WGPUTextureFormat_RGBA8Sint;
+        case RenderFormat::B8G8R8A8_UNORM: return WGPUTextureFormat_BGRA8Unorm;
+        case RenderFormat::R16G16_TYPELESS:
+        case RenderFormat::R16G16_FLOAT: return WGPUTextureFormat_RG16Float;
+        case RenderFormat::R16G16_UNORM: return WGPUTextureFormat_RG16Unorm;
+        case RenderFormat::R16G16_UINT: return WGPUTextureFormat_RG16Uint;
+        case RenderFormat::R16G16_SNORM: return WGPUTextureFormat_RG16Snorm;
+        case RenderFormat::R16G16_SINT: return WGPUTextureFormat_RG16Sint;
+        case RenderFormat::R32_TYPELESS:
+        case RenderFormat::R32_FLOAT: return WGPUTextureFormat_R32Float;
+        case RenderFormat::D32_FLOAT: return WGPUTextureFormat_Depth32Float;
+        case RenderFormat::D32_FLOAT_S8_UINT: return WGPUTextureFormat_Depth32FloatStencil8;
+        case RenderFormat::R32_UINT: return WGPUTextureFormat_R32Uint;
+        case RenderFormat::R32_SINT: return WGPUTextureFormat_R32Sint;
+        case RenderFormat::R8G8_TYPELESS:
+        case RenderFormat::R8G8_UNORM: return WGPUTextureFormat_RG8Unorm;
+        case RenderFormat::R8G8_UINT: return WGPUTextureFormat_RG8Uint;
+        case RenderFormat::R8G8_SNORM: return WGPUTextureFormat_RG8Snorm;
+        case RenderFormat::R8G8_SINT: return WGPUTextureFormat_RG8Sint;
+        case RenderFormat::R16_TYPELESS:
+        case RenderFormat::R16_FLOAT: return WGPUTextureFormat_R16Float;
+        case RenderFormat::D16_UNORM: return WGPUTextureFormat_Depth16Unorm;
+        case RenderFormat::R16_UNORM: return WGPUTextureFormat_R16Unorm;
+        case RenderFormat::R16_UINT: return WGPUTextureFormat_R16Uint;
+        case RenderFormat::R16_SNORM: return WGPUTextureFormat_R16Snorm;
+        case RenderFormat::R16_SINT: return WGPUTextureFormat_R16Sint;
+        case RenderFormat::R8_TYPELESS:
+        case RenderFormat::R8_UNORM: return WGPUTextureFormat_R8Unorm;
+        case RenderFormat::R8_UINT: return WGPUTextureFormat_R8Uint;
+        case RenderFormat::R8_SNORM: return WGPUTextureFormat_R8Snorm;
+        case RenderFormat::R8_SINT: return WGPUTextureFormat_R8Sint;
+        case RenderFormat::BC1_TYPELESS:
+        case RenderFormat::BC1_UNORM: return WGPUTextureFormat_BC1RGBAUnorm;
+        case RenderFormat::BC1_UNORM_SRGB: return WGPUTextureFormat_BC1RGBAUnormSrgb;
+        case RenderFormat::BC2_TYPELESS:
+        case RenderFormat::BC2_UNORM: return WGPUTextureFormat_BC2RGBAUnorm;
+        case RenderFormat::BC2_UNORM_SRGB: return WGPUTextureFormat_BC2RGBAUnormSrgb;
+        case RenderFormat::BC3_TYPELESS:
+        case RenderFormat::BC3_UNORM: return WGPUTextureFormat_BC3RGBAUnorm;
+        case RenderFormat::BC3_UNORM_SRGB: return WGPUTextureFormat_BC3RGBAUnormSrgb;
+        case RenderFormat::BC4_TYPELESS:
+        case RenderFormat::BC4_UNORM: return WGPUTextureFormat_BC4RUnorm;
+        case RenderFormat::BC4_SNORM: return WGPUTextureFormat_BC4RSnorm;
+        case RenderFormat::BC5_TYPELESS:
+        case RenderFormat::BC5_UNORM: return WGPUTextureFormat_BC5RGUnorm;
+        case RenderFormat::BC5_SNORM: return WGPUTextureFormat_BC5RGSnorm;
+        case RenderFormat::BC6H_TYPELESS:
+        case RenderFormat::BC6H_UF16: return WGPUTextureFormat_BC6HRGBUfloat;
+        case RenderFormat::BC6H_SF16: return WGPUTextureFormat_BC6HRGBFloat;
+        case RenderFormat::BC7_TYPELESS:
+        case RenderFormat::BC7_UNORM: return WGPUTextureFormat_BC7RGBAUnorm;
+        case RenderFormat::BC7_UNORM_SRGB: return WGPUTextureFormat_BC7RGBAUnormSrgb;
+        default:
+            // R32G32B32 is a vertex format only.
+            PLUME_WEBGPU_UNSUPPORTED("a texture format WebGPU doesn't have was asked for");
+            return WGPUTextureFormat_Undefined;
+        }
+    }
+
+    static WGPUVertexFormat toVertexFormat(RenderFormat format) {
+        switch (format) {
+        case RenderFormat::R32G32B32A32_FLOAT: return WGPUVertexFormat_Float32x4;
+        case RenderFormat::R32G32B32A32_UINT: return WGPUVertexFormat_Uint32x4;
+        case RenderFormat::R32G32B32A32_SINT: return WGPUVertexFormat_Sint32x4;
+        case RenderFormat::R32G32B32_FLOAT: return WGPUVertexFormat_Float32x3;
+        case RenderFormat::R32G32B32_UINT: return WGPUVertexFormat_Uint32x3;
+        case RenderFormat::R32G32B32_SINT: return WGPUVertexFormat_Sint32x3;
+        case RenderFormat::R32G32_FLOAT: return WGPUVertexFormat_Float32x2;
+        case RenderFormat::R32G32_UINT: return WGPUVertexFormat_Uint32x2;
+        case RenderFormat::R32G32_SINT: return WGPUVertexFormat_Sint32x2;
+        case RenderFormat::R32_FLOAT: return WGPUVertexFormat_Float32;
+        case RenderFormat::R32_UINT: return WGPUVertexFormat_Uint32;
+        case RenderFormat::R32_SINT: return WGPUVertexFormat_Sint32;
+        case RenderFormat::R16G16B16A16_FLOAT: return WGPUVertexFormat_Float16x4;
+        case RenderFormat::R16G16B16A16_UNORM: return WGPUVertexFormat_Unorm16x4;
+        case RenderFormat::R16G16B16A16_SNORM: return WGPUVertexFormat_Snorm16x4;
+        case RenderFormat::R16G16B16A16_UINT: return WGPUVertexFormat_Uint16x4;
+        case RenderFormat::R16G16B16A16_SINT: return WGPUVertexFormat_Sint16x4;
+        case RenderFormat::R16G16_FLOAT: return WGPUVertexFormat_Float16x2;
+        case RenderFormat::R16G16_UNORM: return WGPUVertexFormat_Unorm16x2;
+        case RenderFormat::R16G16_SNORM: return WGPUVertexFormat_Snorm16x2;
+        case RenderFormat::R16G16_UINT: return WGPUVertexFormat_Uint16x2;
+        case RenderFormat::R16G16_SINT: return WGPUVertexFormat_Sint16x2;
+        case RenderFormat::R8G8B8A8_UNORM: return WGPUVertexFormat_Unorm8x4;
+        case RenderFormat::R8G8B8A8_SNORM: return WGPUVertexFormat_Snorm8x4;
+        case RenderFormat::R8G8B8A8_UINT: return WGPUVertexFormat_Uint8x4;
+        case RenderFormat::R8G8B8A8_SINT: return WGPUVertexFormat_Sint8x4;
+        case RenderFormat::B8G8R8A8_UNORM: return WGPUVertexFormat_Unorm8x4BGRA;
+        case RenderFormat::R8G8_UNORM: return WGPUVertexFormat_Unorm8x2;
+        case RenderFormat::R8G8_SNORM: return WGPUVertexFormat_Snorm8x2;
+        case RenderFormat::R8G8_UINT: return WGPUVertexFormat_Uint8x2;
+        case RenderFormat::R8G8_SINT: return WGPUVertexFormat_Sint8x2;
+        case RenderFormat::R16_FLOAT: return WGPUVertexFormat_Float16;
+        case RenderFormat::R16_UNORM: return WGPUVertexFormat_Unorm16;
+        case RenderFormat::R16_UINT: return WGPUVertexFormat_Uint16;
+        case RenderFormat::R16_SINT: return WGPUVertexFormat_Sint16;
+        case RenderFormat::R8_UNORM: return WGPUVertexFormat_Unorm8;
+        case RenderFormat::R8_UINT: return WGPUVertexFormat_Uint8;
+        case RenderFormat::R8_SINT: return WGPUVertexFormat_Sint8;
+        default:
+            PLUME_WEBGPU_UNSUPPORTED("a vertex format WebGPU doesn't have was asked for");
+            return WGPUVertexFormat_Float32;
+        }
+    }
+
+    static WGPUIndexFormat toIndexFormat(RenderFormat format) {
+        switch (format) {
+        case RenderFormat::R16_UINT: return WGPUIndexFormat_Uint16;
+        case RenderFormat::R32_UINT: return WGPUIndexFormat_Uint32;
+        default:
+            assert(false && "Unknown index format.");
+            return WGPUIndexFormat_Undefined;
+        }
+    }
+
+    static WGPUTextureDimension toWGPU(RenderTextureDimension dimension) {
+        switch (dimension) {
+        case RenderTextureDimension::TEXTURE_1D: return WGPUTextureDimension_1D;
+        case RenderTextureDimension::TEXTURE_3D: return WGPUTextureDimension_3D;
+        default: return WGPUTextureDimension_2D;
+        }
+    }
+
+    static WGPUTextureViewDimension viewDimension(const RenderTextureDesc &textureDesc, const RenderTextureViewDesc *viewDesc) {
+        RenderTextureViewDimension dimension = (viewDesc != nullptr) ? viewDesc->dimension : RenderTextureDimensionToView(textureDesc.dimension);
+        uint32_t arraySize = (viewDesc != nullptr && viewDesc->arraySize != UINT32_MAX) ? viewDesc->arraySize : (textureDesc.arraySize - ((viewDesc != nullptr) ? viewDesc->arrayIndex : 0));
+        switch (dimension) {
+        case RenderTextureViewDimension::TEXTURE_1D: return WGPUTextureViewDimension_1D;
+        case RenderTextureViewDimension::TEXTURE_3D: return WGPUTextureViewDimension_3D;
+        case RenderTextureViewDimension::TEXTURE_CUBE: return (arraySize > 6) ? WGPUTextureViewDimension_CubeArray : WGPUTextureViewDimension_Cube;
+        default: return (arraySize > 1) ? WGPUTextureViewDimension_2DArray : WGPUTextureViewDimension_2D;
+        }
+    }
+
+    static WGPUCompareFunction toWGPU(RenderComparisonFunction function) {
+        switch (function) {
+        case RenderComparisonFunction::NEVER: return WGPUCompareFunction_Never;
+        case RenderComparisonFunction::LESS: return WGPUCompareFunction_Less;
+        case RenderComparisonFunction::EQUAL: return WGPUCompareFunction_Equal;
+        case RenderComparisonFunction::LESS_EQUAL: return WGPUCompareFunction_LessEqual;
+        case RenderComparisonFunction::GREATER: return WGPUCompareFunction_Greater;
+        case RenderComparisonFunction::NOT_EQUAL: return WGPUCompareFunction_NotEqual;
+        case RenderComparisonFunction::GREATER_EQUAL: return WGPUCompareFunction_GreaterEqual;
+        case RenderComparisonFunction::ALWAYS: return WGPUCompareFunction_Always;
+        default: return WGPUCompareFunction_Undefined;
+        }
+    }
+
+    static WGPUStencilOperation toWGPU(RenderStencilOp op) {
+        switch (op) {
+        case RenderStencilOp::ZERO: return WGPUStencilOperation_Zero;
+        case RenderStencilOp::REPLACE: return WGPUStencilOperation_Replace;
+        case RenderStencilOp::INCREMENT_AND_CLAMP: return WGPUStencilOperation_IncrementClamp;
+        case RenderStencilOp::DECREMENT_AND_CLAMP: return WGPUStencilOperation_DecrementClamp;
+        case RenderStencilOp::INVERT: return WGPUStencilOperation_Invert;
+        case RenderStencilOp::INCREMENT_AND_WRAP: return WGPUStencilOperation_IncrementWrap;
+        case RenderStencilOp::DECREMENT_AND_WRAP: return WGPUStencilOperation_DecrementWrap;
+        default: return WGPUStencilOperation_Keep;
+        }
+    }
+
+    static WGPUBlendFactor toWGPU(RenderBlend blend) {
+        switch (blend) {
+        case RenderBlend::ZERO: return WGPUBlendFactor_Zero;
+        case RenderBlend::ONE: return WGPUBlendFactor_One;
+        case RenderBlend::SRC_COLOR: return WGPUBlendFactor_Src;
+        case RenderBlend::INV_SRC_COLOR: return WGPUBlendFactor_OneMinusSrc;
+        case RenderBlend::SRC_ALPHA: return WGPUBlendFactor_SrcAlpha;
+        case RenderBlend::INV_SRC_ALPHA: return WGPUBlendFactor_OneMinusSrcAlpha;
+        case RenderBlend::DEST_ALPHA: return WGPUBlendFactor_DstAlpha;
+        case RenderBlend::INV_DEST_ALPHA: return WGPUBlendFactor_OneMinusDstAlpha;
+        case RenderBlend::DEST_COLOR: return WGPUBlendFactor_Dst;
+        case RenderBlend::INV_DEST_COLOR: return WGPUBlendFactor_OneMinusDst;
+        case RenderBlend::SRC_ALPHA_SAT: return WGPUBlendFactor_SrcAlphaSaturated;
+        case RenderBlend::BLEND_FACTOR: return WGPUBlendFactor_Constant;
+        case RenderBlend::INV_BLEND_FACTOR: return WGPUBlendFactor_OneMinusConstant;
+        case RenderBlend::SRC1_COLOR: return WGPUBlendFactor_Src1;
+        case RenderBlend::INV_SRC1_COLOR: return WGPUBlendFactor_OneMinusSrc1;
+        case RenderBlend::SRC1_ALPHA: return WGPUBlendFactor_Src1Alpha;
+        case RenderBlend::INV_SRC1_ALPHA: return WGPUBlendFactor_OneMinusSrc1Alpha;
+        default: return WGPUBlendFactor_One;
+        }
+    }
+
+    static WGPUBlendOperation toWGPU(RenderBlendOperation op) {
+        switch (op) {
+        case RenderBlendOperation::SUBTRACT: return WGPUBlendOperation_Subtract;
+        case RenderBlendOperation::REV_SUBTRACT: return WGPUBlendOperation_ReverseSubtract;
+        case RenderBlendOperation::MIN: return WGPUBlendOperation_Min;
+        case RenderBlendOperation::MAX: return WGPUBlendOperation_Max;
+        default: return WGPUBlendOperation_Add;
+        }
+    }
+
+    static WGPUPrimitiveTopology toWGPU(RenderPrimitiveTopology topology) {
+        switch (topology) {
+        case RenderPrimitiveTopology::POINT_LIST: return WGPUPrimitiveTopology_PointList;
+        case RenderPrimitiveTopology::LINE_LIST: return WGPUPrimitiveTopology_LineList;
+        case RenderPrimitiveTopology::LINE_STRIP: return WGPUPrimitiveTopology_LineStrip;
+        case RenderPrimitiveTopology::TRIANGLE_STRIP: return WGPUPrimitiveTopology_TriangleStrip;
+        case RenderPrimitiveTopology::TRIANGLE_FAN:
+            PLUME_WEBGPU_UNSUPPORTED("triangle fans are drawn as triangle lists");
+            return WGPUPrimitiveTopology_TriangleList;
+        default: return WGPUPrimitiveTopology_TriangleList;
+        }
+    }
+
+    static WGPUAddressMode toWGPU(RenderTextureAddressMode mode) {
+        switch (mode) {
+        case RenderTextureAddressMode::WRAP: return WGPUAddressMode_Repeat;
+        case RenderTextureAddressMode::MIRROR: return WGPUAddressMode_MirrorRepeat;
+        case RenderTextureAddressMode::BORDER:
+            PLUME_WEBGPU_UNSUPPORTED("border addressing is clamped to the edge");
+            return WGPUAddressMode_ClampToEdge;
+        case RenderTextureAddressMode::MIRROR_ONCE:
+            PLUME_WEBGPU_UNSUPPORTED("mirror-once addressing is mirrored");
+            return WGPUAddressMode_MirrorRepeat;
+        default: return WGPUAddressMode_ClampToEdge;
+        }
+    }
+
+    static bool isIntegerFormat(RenderFormat format, bool &isSigned) {
+        switch (format) {
+        case RenderFormat::R32G32B32A32_UINT: case RenderFormat::R32G32B32_UINT: case RenderFormat::R16G16B16A16_UINT:
+        case RenderFormat::R32G32_UINT: case RenderFormat::R8G8B8A8_UINT: case RenderFormat::R16G16_UINT:
+        case RenderFormat::R32_UINT: case RenderFormat::R8G8_UINT: case RenderFormat::R16_UINT: case RenderFormat::R8_UINT:
+            isSigned = false;
+            return true;
+        case RenderFormat::R32G32B32A32_SINT: case RenderFormat::R32G32B32_SINT: case RenderFormat::R16G16B16A16_SINT:
+        case RenderFormat::R32G32_SINT: case RenderFormat::R8G8B8A8_SINT: case RenderFormat::R16G16_SINT:
+        case RenderFormat::R32_SINT: case RenderFormat::R8G8_SINT: case RenderFormat::R16_SINT: case RenderFormat::R8_SINT:
+            isSigned = true;
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    static bool isFloat32Format(RenderFormat format) {
+        switch (format) {
+        case RenderFormat::R32G32B32A32_TYPELESS: case RenderFormat::R32G32B32A32_FLOAT:
+        case RenderFormat::R32G32_TYPELESS: case RenderFormat::R32G32_FLOAT:
+        case RenderFormat::R32_TYPELESS: case RenderFormat::R32_FLOAT:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    // Bytes per row of blocks, and rows of blocks, for a copy of the given texel size.
+    static void copyFootprint(RenderFormat format, uint32_t width, uint32_t height, uint32_t &bytesPerRow, uint32_t &rows) {
+        const uint32_t blockWidth = RenderFormatBlockWidth(format);
+        bytesPerRow = ((width + blockWidth - 1) / blockWidth) * RenderFormatSize(format);
+        rows = (height + blockWidth - 1) / blockWidth;
+    }
+
+    // WebGPUBuffer
+
+    WebGPUBuffer::WebGPUBuffer(WebGPUDevice *device, WebGPUPool *pool, const RenderBufferDesc &desc) {
+        assert(device != nullptr);
+
+        this->device = device;
+        this->desc = desc;
+
+        WGPUBufferDescriptor bufferDesc = WGPU_BUFFER_DESCRIPTOR_INIT;
+        bufferDesc.size = alignUp(std::max<uint64_t>(desc.size, 4), 4);
+        if (desc.heapType == RenderHeapType::READBACK) {
+            bufferDesc.usage = WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst;
+        }
+        else {
+            bufferDesc.usage = WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst;
+            if (desc.flags & RenderBufferFlag::VERTEX) bufferDesc.usage |= WGPUBufferUsage_Vertex;
+            if (desc.flags & RenderBufferFlag::INDEX) bufferDesc.usage |= WGPUBufferUsage_Index;
+            if (desc.flags & RenderBufferFlag::CONSTANT) bufferDesc.usage |= WGPUBufferUsage_Uniform;
+            if (desc.flags & (RenderBufferFlag::STORAGE | RenderBufferFlag::UNORDERED_ACCESS | RenderBufferFlag::FORMATTED)) bufferDesc.usage |= WGPUBufferUsage_Storage;
+        }
+
+        buffer = wgpuDeviceCreateBuffer(device->device, &bufferDesc);
+        if ((desc.heapType == RenderHeapType::UPLOAD) || (desc.heapType == RenderHeapType::GPU_UPLOAD) || (desc.heapType == RenderHeapType::READBACK)) {
+            shadow.resize(bufferDesc.size, 0);
+        }
+    }
+
+    WebGPUBuffer::~WebGPUBuffer() {
+        if (mapped) {
+            auto &mappedBuffers = device->mappedBuffers;
+            mappedBuffers.erase(std::remove(mappedBuffers.begin(), mappedBuffers.end(), this), mappedBuffers.end());
+        }
+
+        if (buffer != nullptr) {
+            wgpuBufferDestroy(buffer);
+            wgpuBufferRelease(buffer);
+        }
+    }
+
+    void *WebGPUBuffer::map(uint32_t subresource, const RenderRange *readRange) {
+        if (shadow.empty()) {
+            assert(false && "Only UPLOAD and READBACK buffers can be mapped.");
+            return nullptr;
+        }
+
+        if (desc.heapType == RenderHeapType::READBACK) {
+            PLUME_WEBGPU_UNSUPPORTED("READBACK buffers can't be read back synchronously; map() returns stale data");
+        }
+        else if (!mapped) {
+            device->mappedBuffers.emplace_back(this);
+        }
+
+        mapped = true;
+        return shadow.data();
+    }
+
+    void WebGPUBuffer::unmap(uint32_t subresource, const RenderRange *writtenRange) {
+        if (!mapped) {
+            return;
+        }
+
+        mapped = false;
+        if (desc.heapType == RenderHeapType::READBACK) {
+            return;
+        }
+
+        auto &mappedBuffers = device->mappedBuffers;
+        mappedBuffers.erase(std::remove(mappedBuffers.begin(), mappedBuffers.end(), this), mappedBuffers.end());
+        if (writtenRange != nullptr) {
+            flush(writtenRange->begin, writtenRange->end);
+        }
+        else {
+            flush(0, shadow.size());
+        }
+    }
+
+    void WebGPUBuffer::flush(uint64_t begin, uint64_t end) {
+        // writeBuffer wants a multiple of 4 bytes at a multiple of 4.
+        begin = begin & ~uint64_t(3);
+        end = std::min<uint64_t>(alignUp(end, 4), shadow.size());
+        if (end > begin) {
+            wgpuQueueWriteBuffer(device->queue, buffer, begin, shadow.data() + begin, end - begin);
+        }
+    }
+
+    std::unique_ptr<RenderBufferFormattedView> WebGPUBuffer::createBufferFormattedView(RenderFormat format) {
+        return std::make_unique<WebGPUBufferFormattedView>(this, format);
+    }
+
+    void WebGPUBuffer::setName(const std::string &name) {
+        wgpuBufferSetLabel(buffer, toStringView(name));
+    }
+
+    uint64_t WebGPUBuffer::getDeviceAddress() const {
+        assert(false && "WebGPU has no buffer device addresses.");
+        return 0;
+    }
+
+    // WebGPUBufferFormattedView
+
+    WebGPUBufferFormattedView::WebGPUBufferFormattedView(WebGPUBuffer *buffer, RenderFormat format) {
+        // WebGPU has no texel buffers. The view is kept so descriptor sets can bind the buffer as a storage buffer.
+        this->buffer = buffer;
+        this->format = format;
+    }
+
+    WebGPUBufferFormattedView::~WebGPUBufferFormattedView() { }
+
+    // WebGPUTexture
+
+    WebGPUTexture::WebGPUTexture(WebGPUDevice *device, WebGPUPool *pool, const RenderTextureDesc &desc) {
+        assert(device != nullptr);
+
+        this->device = device;
+        this->desc = desc;
+
+        const bool multisampled = desc.multisampling.sampleCount > 1;
+        WGPUTextureDescriptor textureDesc = WGPU_TEXTURE_DESCRIPTOR_INIT;
+        textureDesc.dimension = toWGPU(desc.dimension);
+        textureDesc.size.width = std::max(desc.width, 1U);
+        textureDesc.size.height = std::max(desc.height, 1U);
+        textureDesc.size.depthOrArrayLayers = (desc.dimension == RenderTextureDimension::TEXTURE_3D) ? std::max(desc.depth, 1U) : std::max(desc.arraySize, 1U);
+        textureDesc.format = toWGPU(desc.format);
+        textureDesc.mipLevelCount = std::max(desc.mipLevels, 1U);
+        textureDesc.sampleCount = std::max(desc.multisampling.sampleCount, 1U);
+        textureDesc.usage = WGPUTextureUsage_TextureBinding;
+        if (!multisampled) {
+            textureDesc.usage |= WGPUTextureUsage_CopySrc | WGPUTextureUsage_CopyDst;
+        }
+
+        if (desc.flags & (RenderTextureFlag::RENDER_TARGET | RenderTextureFlag::DEPTH_TARGET)) {
+            textureDesc.usage |= WGPUTextureUsage_RenderAttachment;
+        }
+
+        if (desc.flags & (RenderTextureFlag::STORAGE | RenderTextureFlag::UNORDERED_ACCESS)) {
+            textureDesc.usage |= WGPUTextureUsage_StorageBinding;
+        }
+
+        texture = wgpuDeviceCreateTexture(device->device, &textureDesc);
+    }
+
+    WebGPUTexture::~WebGPUTexture() {
+        releaseHandle();
+    }
+
+    void WebGPUTexture::releaseHandle() {
+        if (defaultView != nullptr) {
+            wgpuTextureViewRelease(defaultView);
+            defaultView = nullptr;
+        }
+
+        if (texture != nullptr) {
+            if (ownsTexture) {
+                wgpuTextureDestroy(texture);
+            }
+
+            wgpuTextureRelease(texture);
+            texture = nullptr;
+        }
+    }
+
+    WGPUTextureView WebGPUTexture::getDefaultView() {
+        if ((defaultView == nullptr) && (texture != nullptr)) {
+            WGPUTextureViewDescriptor viewDesc = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+            viewDesc.dimension = viewDimension(desc, nullptr);
+            if (desc.format == RenderFormat::D32_FLOAT_S8_UINT) {
+                viewDesc.aspect = WGPUTextureAspect_All;
+            }
+
+            defaultView = wgpuTextureCreateView(texture, &viewDesc);
+        }
+
+        return defaultView;
+    }
+
+    std::unique_ptr<RenderTextureView> WebGPUTexture::createTextureView(const RenderTextureViewDesc &desc) const {
+        return std::make_unique<WebGPUTextureView>(this, desc);
+    }
+
+    void WebGPUTexture::setName(const std::string &name) {
+        if (texture != nullptr) {
+            wgpuTextureSetLabel(texture, toStringView(name));
+        }
+    }
+
+    // WebGPUTextureView
+
+    WebGPUTextureView::WebGPUTextureView(const WebGPUTexture *texture, const RenderTextureViewDesc &desc) {
+        assert(texture != nullptr);
+
+        this->texture = texture;
+        this->desc = desc;
+
+        if ((desc.componentMapping.r != RenderSwizzle::IDENTITY) || (desc.componentMapping.g != RenderSwizzle::IDENTITY) ||
+            (desc.componentMapping.b != RenderSwizzle::IDENTITY) || (desc.componentMapping.a != RenderSwizzle::IDENTITY))
+        {
+            PLUME_WEBGPU_UNSUPPORTED("texture view swizzles are ignored");
+        }
+
+        WGPUTextureViewDescriptor viewDesc = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+        viewDesc.format = toWGPU((desc.format != RenderFormat::UNKNOWN) ? desc.format : texture->desc.format);
+        viewDesc.dimension = viewDimension(texture->desc, &desc);
+        viewDesc.baseMipLevel = desc.mipSlice;
+        viewDesc.mipLevelCount = (desc.mipLevels == UINT32_MAX) ? WGPU_MIP_LEVEL_COUNT_UNDEFINED : desc.mipLevels;
+        viewDesc.baseArrayLayer = desc.arrayIndex;
+        viewDesc.arrayLayerCount = (desc.arraySize == UINT32_MAX) ? WGPU_ARRAY_LAYER_COUNT_UNDEFINED : desc.arraySize;
+        if (RenderFormatIsDepth(texture->desc.format) && RenderFormatIsStencil(texture->desc.format)) {
+            viewDesc.format = WGPUTextureFormat_Undefined;
+            viewDesc.aspect = WGPUTextureAspect_DepthOnly;
+        }
+
+        view = wgpuTextureCreateView(texture->texture, &viewDesc);
+    }
+
+    WebGPUTextureView::~WebGPUTextureView() {
+        if (view != nullptr) {
+            wgpuTextureViewRelease(view);
+        }
+    }
+
+    // WebGPUSampler
+
+    WebGPUSampler::WebGPUSampler(WebGPUDevice *device, const RenderSamplerDesc &desc) {
+        assert(device != nullptr);
+
+        this->desc = desc;
+
+        if (desc.mipLODBias != 0.0f) {
+            PLUME_WEBGPU_UNSUPPORTED("sampler LOD bias is ignored");
+        }
+
+        WGPUSamplerDescriptor samplerDesc = WGPU_SAMPLER_DESCRIPTOR_INIT;
+        samplerDesc.addressModeU = toWGPU(desc.addressU);
+        samplerDesc.addressModeV = toWGPU(desc.addressV);
+        samplerDesc.addressModeW = toWGPU(desc.addressW);
+        samplerDesc.magFilter = (desc.magFilter == RenderFilter::LINEAR) ? WGPUFilterMode_Linear : WGPUFilterMode_Nearest;
+        samplerDesc.minFilter = (desc.minFilter == RenderFilter::LINEAR) ? WGPUFilterMode_Linear : WGPUFilterMode_Nearest;
+        samplerDesc.mipmapFilter = (desc.mipmapMode == RenderMipmapMode::LINEAR) ? WGPUMipmapFilterMode_Linear : WGPUMipmapFilterMode_Nearest;
+        samplerDesc.lodMinClamp = std::max(desc.minLOD, 0.0f);
+        samplerDesc.lodMaxClamp = std::min(desc.maxLOD, 32.0f);
+        samplerDesc.compare = desc.comparisonEnabled ? toWGPU(desc.comparisonFunc) : WGPUCompareFunction_Undefined;
+
+        // Anisotropy needs every filter to be linear.
+        const bool allLinear = (samplerDesc.magFilter == WGPUFilterMode_Linear) && (samplerDesc.minFilter == WGPUFilterMode_Linear) && (samplerDesc.mipmapFilter == WGPUMipmapFilterMode_Linear);
+        samplerDesc.maxAnisotropy = (desc.anisotropyEnabled && allLinear) ? uint16_t(std::clamp(desc.maxAnisotropy, 1U, 16U)) : 1;
+        sampler = wgpuDeviceCreateSampler(device->device, &samplerDesc);
+    }
+
+    WebGPUSampler::~WebGPUSampler() {
+        if (sampler != nullptr) {
+            wgpuSamplerRelease(sampler);
+        }
+    }
+
+    // WebGPUShader
+
+    WebGPUShader::WebGPUShader(WebGPUDevice *device, const void *data, uint64_t size, const char *entryPointName, RenderShaderFormat format) {
+        assert(device != nullptr);
+        assert(format == RenderShaderFormat::WGSL);
+
+        this->entryPointName = (entryPointName != nullptr) ? entryPointName : "main";
+
+        // The blob may carry a terminating zero.
+        const char *code = reinterpret_cast<const char *>(data);
+        size_t length = size_t(size);
+        while ((length > 0) && (code[length - 1] == '\0')) {
+            length--;
+        }
+
+        WGPUShaderSourceWGSL wgslSource = WGPU_SHADER_SOURCE_WGSL_INIT;
+        wgslSource.code = { code, length };
+
+        WGPUShaderModuleDescriptor moduleDesc = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+        moduleDesc.nextInChain = &wgslSource.chain;
+        module = wgpuDeviceCreateShaderModule(device->device, &moduleDesc);
+    }
+
+    WebGPUShader::~WebGPUShader() {
+        if (module != nullptr) {
+            wgpuShaderModuleRelease(module);
+        }
+    }
+
+    void WebGPUShader::setName(const std::string &name) {
+        wgpuShaderModuleSetLabel(module, toStringView(name));
+    }
+
+    // WebGPUShaderStage
+
+    WebGPUShaderStage::WebGPUShaderStage(const RenderShader *shader) {
+        const WebGPUShader *webgpuShader = static_cast<const WebGPUShader *>(shader);
+        if (webgpuShader != nullptr) {
+            module = webgpuShader->module;
+            wgpuShaderModuleAddRef(module);
+            entryPointName = webgpuShader->entryPointName;
+        }
+    }
+
+    WebGPUShaderStage::~WebGPUShaderStage() {
+        if (module != nullptr) {
+            wgpuShaderModuleRelease(module);
+        }
+    }
+
+    // WebGPUDescriptorSet
+
+    WebGPUDescriptorSet::WebGPUDescriptorSet(WebGPUDevice *device, const RenderDescriptorSetDesc &desc) {
+        assert(device != nullptr);
+
+        this->device = device;
+
+        // Descriptors are numbered across the ranges in order. Element i of a range with more than one descriptor is
+        // bound at the range's binding + i, since core WebGPU has no binding arrays.
+        for (uint32_t i = 0; i < desc.descriptorRangesCount; i++) {
+            const RenderDescriptorRange &range = desc.descriptorRanges[i];
+            uint32_t count = range.count;
+            if (desc.lastRangeIsBoundless && (i == desc.descriptorRangesCount - 1)) {
+                PLUME_WEBGPU_UNSUPPORTED("boundless descriptor ranges are bound as separate bindings");
+                count = desc.boundlessRangeSize;
+            }
+
+            for (uint32_t j = 0; j < count; j++) {
+                Binding binding;
+                binding.type = range.type;
+                binding.binding = range.binding + j;
+                if (range.immutableSampler != nullptr) {
+                    binding.sampler = static_cast<const WebGPUSampler *>(range.immutableSampler[j]);
+                }
+
+                bindings.emplace_back(binding);
+            }
+        }
+    }
+
+    WebGPUDescriptorSet::~WebGPUDescriptorSet() {
+        if (bindGroup != nullptr) {
+            wgpuBindGroupRelease(bindGroup);
+        }
+    }
+
+    void WebGPUDescriptorSet::setBuffer(uint32_t descriptorIndex, const RenderBuffer *buffer, uint64_t bufferSize, const RenderBufferStructuredView *bufferStructuredView, const RenderBufferFormattedView *bufferFormattedView) {
+        assert(descriptorIndex < bindings.size());
+
+        Binding &binding = bindings[descriptorIndex];
+        binding.buffer = static_cast<const WebGPUBuffer *>(buffer);
+        binding.bufferOffset = 0;
+        if (bufferStructuredView != nullptr) {
+            binding.bufferOffset = uint64_t(bufferStructuredView->firstElement) * bufferStructuredView->structureByteStride;
+        }
+
+        binding.bufferSize = (bufferSize > 0) ? bufferSize : WGPU_WHOLE_SIZE;
+        dirty = true;
+    }
+
+    void WebGPUDescriptorSet::setTexture(uint32_t descriptorIndex, const RenderTexture *texture, RenderTextureLayout textureLayout, const RenderTextureView *textureView) {
+        assert(descriptorIndex < bindings.size());
+
+        Binding &binding = bindings[descriptorIndex];
+        binding.texture = static_cast<const WebGPUTexture *>(texture);
+        binding.textureView = static_cast<const WebGPUTextureView *>(textureView);
+        dirty = true;
+    }
+
+    void WebGPUDescriptorSet::setSampler(uint32_t descriptorIndex, const RenderSampler *sampler) {
+        assert(descriptorIndex < bindings.size());
+
+        bindings[descriptorIndex].sampler = static_cast<const WebGPUSampler *>(sampler);
+        dirty = true;
+    }
+
+    void WebGPUDescriptorSet::setAccelerationStructure(uint32_t descriptorIndex, const RenderAccelerationStructure *accelerationStructure) {
+        assert(false && "WebGPU has no acceleration structures.");
+    }
+
+    // Builds the bind group layout from what is bound, and the bind group for it. Unset descriptors are left out of
+    // both, so a shader that reads one fails pipeline validation instead of reading garbage.
+    void WebGPUDescriptorSet::update() {
+        if (!dirty) {
+            return;
+        }
+
+        std::vector<WGPUBindGroupLayoutEntry> layoutEntries;
+        std::vector<WGPUBindGroupEntry> groupEntries;
+        std::string key;
+        for (const Binding &binding : bindings) {
+            WGPUBindGroupLayoutEntry layoutEntry = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+            WGPUBindGroupEntry groupEntry = WGPU_BIND_GROUP_ENTRY_INIT;
+            layoutEntry.binding = binding.binding;
+            layoutEntry.visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment | WGPUShaderStage_Compute;
+            groupEntry.binding = binding.binding;
+
+            char entryKey[64];
+            switch (binding.type) {
+            case RenderDescriptorRangeType::CONSTANT_BUFFER:
+            case RenderDescriptorRangeType::FORMATTED_BUFFER:
+            case RenderDescriptorRangeType::STRUCTURED_BUFFER:
+            case RenderDescriptorRangeType::BYTE_ADDRESS_BUFFER:
+            case RenderDescriptorRangeType::READ_WRITE_FORMATTED_BUFFER:
+            case RenderDescriptorRangeType::READ_WRITE_STRUCTURED_BUFFER:
+            case RenderDescriptorRangeType::READ_WRITE_BYTE_ADDRESS_BUFFER: {
+                if (binding.buffer == nullptr) {
+                    continue;
+                }
+
+                if (binding.type == RenderDescriptorRangeType::CONSTANT_BUFFER) {
+                    layoutEntry.buffer.type = WGPUBufferBindingType_Uniform;
+                }
+                else if ((binding.type == RenderDescriptorRangeType::FORMATTED_BUFFER) || (binding.type == RenderDescriptorRangeType::STRUCTURED_BUFFER) || (binding.type == RenderDescriptorRangeType::BYTE_ADDRESS_BUFFER)) {
+                    layoutEntry.buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
+                }
+                else {
+                    // Writable storage isn't allowed in vertex shaders.
+                    layoutEntry.buffer.type = WGPUBufferBindingType_Storage;
+                    layoutEntry.visibility = WGPUShaderStage_Fragment | WGPUShaderStage_Compute;
+                }
+
+                groupEntry.buffer = binding.buffer->buffer;
+                groupEntry.offset = binding.bufferOffset;
+                groupEntry.size = binding.bufferSize;
+                snprintf(entryKey, sizeof(entryKey), "b%u:%d;", binding.binding, int(layoutEntry.buffer.type));
+                break;
+            }
+            case RenderDescriptorRangeType::TEXTURE:
+            case RenderDescriptorRangeType::READ_WRITE_TEXTURE: {
+                if (binding.texture == nullptr) {
+                    continue;
+                }
+
+                const RenderTextureDesc &textureDesc = binding.texture->desc;
+                const RenderTextureViewDesc *viewDesc = (binding.textureView != nullptr) ? &binding.textureView->desc : nullptr;
+                const RenderFormat format = ((viewDesc != nullptr) && (viewDesc->format != RenderFormat::UNKNOWN)) ? viewDesc->format : textureDesc.format;
+                const WGPUTextureViewDimension dimension = viewDimension(textureDesc, viewDesc);
+                if (binding.type == RenderDescriptorRangeType::READ_WRITE_TEXTURE) {
+                    layoutEntry.storageTexture.access = WGPUStorageTextureAccess_ReadWrite;
+                    layoutEntry.storageTexture.format = toWGPU(format);
+                    layoutEntry.storageTexture.viewDimension = dimension;
+                    layoutEntry.visibility = WGPUShaderStage_Fragment | WGPUShaderStage_Compute;
+                    snprintf(entryKey, sizeof(entryKey), "s%u:%d:%d;", binding.binding, int(layoutEntry.storageTexture.format), int(dimension));
+                }
+                else {
+                    bool isSigned = false;
+                    const bool multisampled = textureDesc.multisampling.sampleCount > 1;
+                    if (RenderFormatIsDepth(format)) {
+                        layoutEntry.texture.sampleType = WGPUTextureSampleType_Depth;
+                    }
+                    else if (isIntegerFormat(format, isSigned)) {
+                        layoutEntry.texture.sampleType = isSigned ? WGPUTextureSampleType_Sint : WGPUTextureSampleType_Uint;
+                    }
+                    else if (multisampled || (isFloat32Format(format) && !device->float32Filterable)) {
+                        layoutEntry.texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
+                    }
+                    else {
+                        layoutEntry.texture.sampleType = WGPUTextureSampleType_Float;
+                    }
+
+                    layoutEntry.texture.viewDimension = dimension;
+                    layoutEntry.texture.multisampled = multisampled;
+                    snprintf(entryKey, sizeof(entryKey), "t%u:%d:%d:%d;", binding.binding, int(layoutEntry.texture.sampleType), int(dimension), int(multisampled));
+                }
+
+                groupEntry.textureView = (binding.textureView != nullptr) ? binding.textureView->view : const_cast<WebGPUTexture *>(binding.texture)->getDefaultView();
+                break;
+            }
+            case RenderDescriptorRangeType::SAMPLER: {
+                if (binding.sampler == nullptr) {
+                    continue;
+                }
+
+                const RenderSamplerDesc &samplerDesc = binding.sampler->desc;
+                if (samplerDesc.comparisonEnabled) {
+                    layoutEntry.sampler.type = WGPUSamplerBindingType_Comparison;
+                }
+                else if ((samplerDesc.minFilter == RenderFilter::LINEAR) || (samplerDesc.magFilter == RenderFilter::LINEAR) || (samplerDesc.mipmapMode == RenderMipmapMode::LINEAR)) {
+                    layoutEntry.sampler.type = WGPUSamplerBindingType_Filtering;
+                }
+                else {
+                    layoutEntry.sampler.type = WGPUSamplerBindingType_NonFiltering;
+                }
+
+                groupEntry.sampler = binding.sampler->sampler;
+                snprintf(entryKey, sizeof(entryKey), "p%u:%d;", binding.binding, int(layoutEntry.sampler.type));
+                break;
+            }
+            default:
+                assert(false && "Unsupported descriptor type.");
+                continue;
+            }
+
+            key += entryKey;
+            layoutEntries.emplace_back(layoutEntry);
+            groupEntries.emplace_back(groupEntry);
+        }
+
+        layout = device->getBindGroupLayout(key, layoutEntries);
+
+        if (bindGroup != nullptr) {
+            wgpuBindGroupRelease(bindGroup);
+        }
+
+        WGPUBindGroupDescriptor groupDesc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+        groupDesc.layout = layout;
+        groupDesc.entryCount = groupEntries.size();
+        groupDesc.entries = groupEntries.data();
+        bindGroup = wgpuDeviceCreateBindGroup(device->device, &groupDesc);
+        dirty = false;
+    }
+
+    // WebGPUPipeline
+
+    WebGPUPipeline::WebGPUPipeline(WebGPUDevice *device, Type type) {
+        assert(device != nullptr);
+        assert(type != Type::Unknown);
+
+        this->device = device;
+        this->type = type;
+    }
+
+    WebGPUPipeline::~WebGPUPipeline() { }
+
+    void WebGPUPipeline::setName(const std::string &name) { }
+
+    RenderPipelineProgram WebGPUPipeline::getProgram(const std::string &name) const {
+        assert(false && "Pipeline programs are only for raytracing.");
+        return RenderPipelineProgram();
+    }
+
+    static std::vector<WGPUConstantEntry> toConstantEntries(const std::vector<RenderSpecConstant> &specConstants, std::vector<std::string> &keys) {
+        // naga turns SPIR-V specialization constants into overrides with the constant's id.
+        std::vector<WGPUConstantEntry> entries;
+        keys.clear();
+        keys.reserve(specConstants.size());
+        for (const RenderSpecConstant &constant : specConstants) {
+            keys.emplace_back(std::to_string(constant.index));
+        }
+
+        for (size_t i = 0; i < specConstants.size(); i++) {
+            WGPUConstantEntry entry = WGPU_CONSTANT_ENTRY_INIT;
+            entry.key = toStringView(keys[i]);
+            entry.value = double(specConstants[i].value);
+            entries.emplace_back(entry);
+        }
+
+        return entries;
+    }
+
+    // WebGPUComputePipeline
+
+    WebGPUComputePipeline::WebGPUComputePipeline(WebGPUDevice *device, const RenderComputePipelineDesc &desc) : WebGPUPipeline(device, Type::Compute), computeStage(desc.computeShader) {
+        this->desc = desc;
+        this->desc.computeShader = nullptr;
+        specConstants.assign(desc.specConstants, desc.specConstants + desc.specConstantsCount);
+        this->desc.specConstants = nullptr;
+    }
+
+    WebGPUComputePipeline::~WebGPUComputePipeline() {
+        for (auto &it : pipelines) {
+            wgpuComputePipelineRelease(it.second);
+        }
+    }
+
+    WGPUComputePipeline WebGPUComputePipeline::get(WGPUPipelineLayout layout) {
+        auto it = pipelines.find(layout);
+        if (it != pipelines.end()) {
+            return it->second;
+        }
+
+        std::vector<std::string> keys;
+        std::vector<WGPUConstantEntry> constants = toConstantEntries(specConstants, keys);
+        WGPUComputePipelineDescriptor pipelineDesc = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
+        pipelineDesc.layout = layout;
+        pipelineDesc.compute.module = computeStage.module;
+        pipelineDesc.compute.entryPoint = toStringView(computeStage.entryPointName);
+        pipelineDesc.compute.constantCount = constants.size();
+        pipelineDesc.compute.constants = constants.data();
+        WGPUComputePipeline pipeline = wgpuDeviceCreateComputePipeline(device->device, &pipelineDesc);
+        pipelines[layout] = pipeline;
+        return pipeline;
+    }
+
+    // WebGPUGraphicsPipeline
+
+    WebGPUGraphicsPipeline::WebGPUGraphicsPipeline(WebGPUDevice *device, const RenderGraphicsPipelineDesc &desc) : WebGPUPipeline(device, Type::Graphics), vertexStage(desc.vertexShader), pixelStage(desc.pixelShader) {
+        if (desc.geometryShader != nullptr) {
+            PLUME_WEBGPU_UNSUPPORTED("geometry shaders are ignored");
+        }
+
+        if (desc.logicOpEnabled) {
+            PLUME_WEBGPU_UNSUPPORTED("logic ops are ignored");
+        }
+
+        this->desc = desc;
+        inputSlots.assign(desc.inputSlots, desc.inputSlots + desc.inputSlotsCount);
+        inputElements.assign(desc.inputElements, desc.inputElements + desc.inputElementsCount);
+        specConstants.assign(desc.specConstants, desc.specConstants + desc.specConstantsCount);
+        this->desc.inputSlots = nullptr;
+        this->desc.inputElements = nullptr;
+        this->desc.specConstants = nullptr;
+        this->desc.vertexShader = nullptr;
+        this->desc.geometryShader = nullptr;
+        this->desc.pixelShader = nullptr;
+    }
+
+    WebGPUGraphicsPipeline::~WebGPUGraphicsPipeline() {
+        for (auto &it : pipelines) {
+            wgpuRenderPipelineRelease(it.second);
+        }
+    }
+
+    WGPURenderPipeline WebGPUGraphicsPipeline::get(WGPUPipelineLayout layout) {
+        auto it = pipelines.find(layout);
+        if (it != pipelines.end()) {
+            return it->second;
+        }
+
+        std::vector<std::string> keys;
+        std::vector<WGPUConstantEntry> constants = toConstantEntries(specConstants, keys);
+
+        // Vertex input.
+        std::vector<std::vector<WGPUVertexAttribute>> attributes(inputSlots.size());
+        std::vector<WGPUVertexBufferLayout> bufferLayouts;
+        uint32_t maxSlotIndex = 0;
+        for (const RenderInputSlot &slot : inputSlots) {
+            maxSlotIndex = std::max(maxSlotIndex, slot.index + 1);
+        }
+
+        bufferLayouts.resize(maxSlotIndex);
+        attributes.resize(maxSlotIndex);
+        for (WGPUVertexBufferLayout &bufferLayout : bufferLayouts) {
+            bufferLayout = WGPU_VERTEX_BUFFER_LAYOUT_INIT;
+            // A slot no input uses stays Undefined with no attributes, which leaves it out.
+            bufferLayout.stepMode = WGPUVertexStepMode_Undefined;
+        }
+
+        for (const RenderInputSlot &slot : inputSlots) {
+            WGPUVertexBufferLayout &bufferLayout = bufferLayouts[slot.index];
+            bufferLayout.stepMode = (slot.classification == RenderInputSlotClassification::PER_INSTANCE_DATA) ? WGPUVertexStepMode_Instance : WGPUVertexStepMode_Vertex;
+            bufferLayout.arrayStride = slot.stride;
+        }
+
+        for (const RenderInputElement &element : inputElements) {
+            assert(element.slotIndex < maxSlotIndex);
+            WGPUVertexAttribute attribute = WGPU_VERTEX_ATTRIBUTE_INIT;
+            attribute.format = toVertexFormat(element.format);
+            attribute.offset = element.alignedByteOffset;
+            attribute.shaderLocation = element.location;
+            attributes[element.slotIndex].emplace_back(attribute);
+        }
+
+        for (uint32_t i = 0; i < maxSlotIndex; i++) {
+            bufferLayouts[i].attributeCount = attributes[i].size();
+            bufferLayouts[i].attributes = attributes[i].data();
+        }
+
+        WGPURenderPipelineDescriptor pipelineDesc = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+        pipelineDesc.layout = layout;
+        pipelineDesc.vertex.module = vertexStage.module;
+        pipelineDesc.vertex.entryPoint = toStringView(vertexStage.entryPointName);
+        pipelineDesc.vertex.constantCount = constants.size();
+        pipelineDesc.vertex.constants = constants.data();
+        pipelineDesc.vertex.bufferCount = bufferLayouts.size();
+        pipelineDesc.vertex.buffers = bufferLayouts.data();
+        pipelineDesc.primitive.topology = toWGPU(desc.primitiveTopology);
+        pipelineDesc.primitive.frontFace = (desc.frontFace == RenderFrontFace::COUNTER_CLOCKWISE) ? WGPUFrontFace_CCW : WGPUFrontFace_CW;
+        pipelineDesc.primitive.cullMode = (desc.cullMode == RenderCullMode::FRONT) ? WGPUCullMode_Front : ((desc.cullMode == RenderCullMode::BACK) ? WGPUCullMode_Back : WGPUCullMode_None);
+        pipelineDesc.primitive.unclippedDepth = !desc.depthClipEnabled && device->depthClipControl;
+        pipelineDesc.multisample.count = std::max(desc.multisampling.sampleCount, 1U);
+        pipelineDesc.multisample.alphaToCoverageEnabled = desc.alphaToCoverageEnabled;
+
+        WGPUDepthStencilState depthStencil = WGPU_DEPTH_STENCIL_STATE_INIT;
+        if (desc.depthTargetFormat != RenderFormat::UNKNOWN) {
+            depthStencil.format = toWGPU(desc.depthTargetFormat);
+            depthStencil.depthWriteEnabled = (desc.depthEnabled && desc.depthWriteEnabled) ? WGPUOptionalBool_True : WGPUOptionalBool_False;
+            depthStencil.depthCompare = desc.depthEnabled ? toWGPU(desc.depthFunction) : WGPUCompareFunction_Always;
+            depthStencil.depthBias = desc.depthBias;
+            depthStencil.depthBiasSlopeScale = desc.slopeScaledDepthBias;
+            depthStencil.depthBiasClamp = desc.depthBiasClamp;
+            if (desc.stencilEnabled) {
+                depthStencil.stencilFront = { toWGPU(desc.stencilFrontFace.compareFunction), toWGPU(desc.stencilFrontFace.failOp), toWGPU(desc.stencilFrontFace.depthFailOp), toWGPU(desc.stencilFrontFace.passOp) };
+                depthStencil.stencilBack = { toWGPU(desc.stencilBackFace.compareFunction), toWGPU(desc.stencilBackFace.failOp), toWGPU(desc.stencilBackFace.depthFailOp), toWGPU(desc.stencilBackFace.passOp) };
+                depthStencil.stencilReadMask = desc.stencilReadMask;
+                depthStencil.stencilWriteMask = desc.stencilWriteMask;
+            }
+            else {
+                depthStencil.stencilReadMask = 0;
+                depthStencil.stencilWriteMask = 0;
+            }
+
+            pipelineDesc.depthStencil = &depthStencil;
+        }
+
+        WGPUColorTargetState targets[RenderGraphicsPipelineDesc::MaxRenderTargets];
+        WGPUBlendState blends[RenderGraphicsPipelineDesc::MaxRenderTargets];
+        for (uint32_t i = 0; i < desc.renderTargetCount; i++) {
+            const RenderBlendDesc &blendDesc = desc.renderTargetBlend[i];
+            targets[i] = WGPU_COLOR_TARGET_STATE_INIT;
+            targets[i].format = toWGPU(desc.renderTargetFormat[i]);
+            targets[i].writeMask = blendDesc.renderTargetWriteMask & WGPUColorWriteMask_All;
+            if (blendDesc.blendEnabled) {
+                blends[i] = WGPU_BLEND_STATE_INIT;
+                blends[i].color = { toWGPU(blendDesc.blendOp), toWGPU(blendDesc.srcBlend), toWGPU(blendDesc.dstBlend) };
+                blends[i].alpha = { toWGPU(blendDesc.blendOpAlpha), toWGPU(blendDesc.srcBlendAlpha), toWGPU(blendDesc.dstBlendAlpha) };
+                targets[i].blend = &blends[i];
+            }
+        }
+
+        WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
+        if (pixelStage.module != nullptr) {
+            fragment.module = pixelStage.module;
+            fragment.entryPoint = toStringView(pixelStage.entryPointName);
+            fragment.constantCount = constants.size();
+            fragment.constants = constants.data();
+            fragment.targetCount = desc.renderTargetCount;
+            fragment.targets = targets;
+            pipelineDesc.fragment = &fragment;
+        }
+
+        WGPURenderPipeline pipeline = wgpuDeviceCreateRenderPipeline(device->device, &pipelineDesc);
+        pipelines[layout] = pipeline;
+        return pipeline;
+    }
+
+    // WebGPUPipelineLayout
+
+    WebGPUPipelineLayout::WebGPUPipelineLayout(WebGPUDevice *device, const RenderPipelineLayoutDesc &desc) {
+        assert(device != nullptr);
+
+        this->device = device;
+        descriptorSetCount = desc.descriptorSetDescsCount;
+        pushConstantRanges.assign(desc.pushConstantRanges, desc.pushConstantRanges + desc.pushConstantRangesCount);
+
+        if (desc.rootDescriptorDescsCount > 0) {
+            PLUME_WEBGPU_UNSUPPORTED("root descriptors are ignored");
+        }
+
+        for (const RenderPushConstantRange &range : pushConstantRanges) {
+            pushConstantsSize = std::max(pushConstantsSize, range.offset + range.size);
+        }
+
+        assert(((pushConstantsSize == 0) || (descriptorSetCount <= PushConstantsGroup)) && "Push constants take bind group 3, so a layout with them can have 3 descriptor sets at most.");
+    }
+
+    WebGPUPipelineLayout::~WebGPUPipelineLayout() { }
+
+    // WebGPUSwapChain
+
+    WebGPUSwapChain::WebGPUSwapChain(WebGPUCommandQueue *commandQueue, const RenderSwapChainDesc &desc) {
+        assert(commandQueue != nullptr);
+        assert(desc.renderWindow != nullptr);
+
+        this->commandQueue = commandQueue;
+        this->desc = desc;
+        selector = desc.renderWindow;
+        this->desc.renderWindow = selector.c_str();
+
+        WGPUEmscriptenSurfaceSourceCanvasHTMLSelector canvasSource = WGPU_EMSCRIPTEN_SURFACE_SOURCE_CANVAS_HTML_SELECTOR_INIT;
+        canvasSource.selector = toStringView(selector);
+        WGPUSurfaceDescriptor surfaceDesc = WGPU_SURFACE_DESCRIPTOR_INIT;
+        surfaceDesc.nextInChain = &canvasSource.chain;
+        WGPUInstance instance = wgpuCreateInstance(nullptr);
+        surface = wgpuInstanceCreateSurface(instance, &surfaceDesc);
+        wgpuInstanceRelease(instance);
+
+        // The canvas hands out a new texture every frame, so the swap chain's textures are proxies that acquireTexture()
+        // points at it.
+        const uint32_t textureCount = std::max(desc.textureCount, 1U);
+        for (uint32_t i = 0; i < textureCount; i++) {
+            auto texture = std::make_unique<WebGPUTexture>();
+            texture->device = commandQueue->device;
+            texture->ownsTexture = false;
+            texture->desc = RenderTextureDesc::ColorTarget(1, 1, desc.format);
+            textures.emplace_back(std::move(texture));
+        }
+    }
+
+    WebGPUSwapChain::~WebGPUSwapChain() {
+        textures.clear();
+        if (surface != nullptr) {
+            wgpuSurfaceUnconfigure(surface);
+            wgpuSurfaceRelease(surface);
+        }
+    }
+
+    bool WebGPUSwapChain::present(uint32_t textureIndex, RenderCommandSemaphore **waitSemaphores, uint32_t waitSemaphoreCount) {
+        // The browser presents the canvas when this thread returns to its event loop.
+        return true;
+    }
+
+    void WebGPUSwapChain::wait() { }
+
+    void WebGPUSwapChain::getCanvasSize(uint32_t &width, uint32_t &height) const {
+        int canvasWidth = 0, canvasHeight = 0;
+        emscripten_get_canvas_element_size(selector.c_str(), &canvasWidth, &canvasHeight);
+        width = uint32_t(std::max(canvasWidth, 0));
+        height = uint32_t(std::max(canvasHeight, 0));
+    }
+
+    bool WebGPUSwapChain::resize() {
+        getCanvasSize(width, height);
+        if (isEmpty()) {
+            return false;
+        }
+
+        WGPUSurfaceConfiguration config = WGPU_SURFACE_CONFIGURATION_INIT;
+        config.device = commandQueue->device->device;
+        config.format = toWGPU(desc.format);
+        config.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopyDst;
+        config.width = width;
+        config.height = height;
+        config.alphaMode = WGPUCompositeAlphaMode_Opaque;
+        config.presentMode = WGPUPresentMode_Fifo;
+        wgpuSurfaceConfigure(surface, &config);
+
+        for (auto &texture : textures) {
+            texture->releaseHandle();
+            texture->desc.width = width;
+            texture->desc.height = height;
+        }
+
+        return true;
+    }
+
+    bool WebGPUSwapChain::needsResize() const {
+        uint32_t canvasWidth, canvasHeight;
+        getCanvasSize(canvasWidth, canvasHeight);
+        return (canvasWidth != width) || (canvasHeight != height);
+    }
+
+    void WebGPUSwapChain::setVsyncEnabled(bool vsyncEnabled) {
+        // The browser always paces the canvas to the display.
+        this->vsyncEnabled = vsyncEnabled;
+    }
+
+    bool WebGPUSwapChain::isVsyncEnabled() const {
+        return vsyncEnabled;
+    }
+
+    uint32_t WebGPUSwapChain::getWidth() const {
+        return width;
+    }
+
+    uint32_t WebGPUSwapChain::getHeight() const {
+        return height;
+    }
+
+    RenderTexture *WebGPUSwapChain::getTexture(uint32_t textureIndex) {
+        assert(textureIndex < textures.size());
+        return textures[textureIndex].get();
+    }
+
+    uint32_t WebGPUSwapChain::getTextureCount() const {
+        return uint32_t(textures.size());
+    }
+
+    bool WebGPUSwapChain::acquireTexture(RenderCommandSemaphore *signalSemaphore, uint32_t *textureIndex) {
+        assert(textureIndex != nullptr);
+
+        if (isEmpty()) {
+            return false;
+        }
+
+        WGPUSurfaceTexture surfaceTexture = WGPU_SURFACE_TEXTURE_INIT;
+        wgpuSurfaceGetCurrentTexture(surface, &surfaceTexture);
+        if ((surfaceTexture.status != WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal) && (surfaceTexture.status != WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal)) {
+            return false;
+        }
+
+        WebGPUTexture *texture = textures[nextTextureIndex].get();
+        texture->releaseHandle();
+        texture->texture = surfaceTexture.texture;
+        *textureIndex = nextTextureIndex;
+        nextTextureIndex = (nextTextureIndex + 1) % textures.size();
+        return true;
+    }
+
+    RenderWindow WebGPUSwapChain::getWindow() const {
+        return desc.renderWindow;
+    }
+
+    bool WebGPUSwapChain::isEmpty() const {
+        return (width == 0) || (height == 0);
+    }
+
+    uint32_t WebGPUSwapChain::getRefreshRate() const {
+        // The browser doesn't say. 60 is what requestAnimationFrame runs at on most displays.
+        return 60;
+    }
+
+    // WebGPUFramebuffer
+
+    WebGPUFramebuffer::WebGPUFramebuffer(const RenderFramebufferDesc &desc) {
+        for (uint32_t i = 0; i < desc.colorAttachmentsCount; i++) {
+            const WebGPUTexture *texture = static_cast<const WebGPUTexture *>(desc.colorAttachments[i]);
+            colorTextures.emplace_back(texture);
+            colorViews.emplace_back((desc.colorAttachmentViews != nullptr) ? static_cast<const WebGPUTextureView *>(desc.colorAttachmentViews[i]) : nullptr);
+            if (i == 0) {
+                width = texture->desc.width;
+                height = texture->desc.height;
+            }
+        }
+
+        depthTexture = static_cast<const WebGPUTexture *>(desc.depthAttachment);
+        depthView = static_cast<const WebGPUTextureView *>(desc.depthAttachmentView);
+        depthReadOnly = desc.depthAttachmentReadOnly;
+        if ((depthTexture != nullptr) && colorTextures.empty()) {
+            width = depthTexture->desc.width;
+            height = depthTexture->desc.height;
+        }
+    }
+
+    WebGPUFramebuffer::~WebGPUFramebuffer() { }
+
+    uint32_t WebGPUFramebuffer::getWidth() const {
+        return width;
+    }
+
+    uint32_t WebGPUFramebuffer::getHeight() const {
+        return height;
+    }
+
+    // WebGPUCommandList
+
+    WebGPUCommandList::WebGPUCommandList(WebGPUDevice *device) {
+        assert(device != nullptr);
+
+        this->device = device;
+    }
+
+    WebGPUCommandList::~WebGPUCommandList() {
+        endRenderPass();
+        if (encoder != nullptr) {
+            wgpuCommandEncoderRelease(encoder);
+        }
+
+        if (commandBuffer != nullptr) {
+            wgpuCommandBufferRelease(commandBuffer);
+        }
+
+        for (PushConstantsChunk &chunk : pushConstantsChunks) {
+            for (auto &it : chunk.bindGroups) {
+                wgpuBindGroupRelease(it.second);
+            }
+
+            wgpuBufferDestroy(chunk.buffer);
+            wgpuBufferRelease(chunk.buffer);
+        }
+    }
+
+    void WebGPUCommandList::begin() {
+        assert(encoder == nullptr);
+
+        if (commandBuffer != nullptr) {
+            wgpuCommandBufferRelease(commandBuffer);
+            commandBuffer = nullptr;
+        }
+
+        encoder = wgpuDeviceCreateCommandEncoder(device->device, nullptr);
+        framebuffer = nullptr;
+        pipeline = nullptr;
+        graphics = BindState();
+        compute = BindState();
+        vertexBufferCount = 0;
+        indexBuffer = RenderIndexBufferView();
+        viewportSet = false;
+        scissorSet = false;
+        renderStateDirty = true;
+        pushConstantsChunkIndex = 0;
+        for (PushConstantsChunk &chunk : pushConstantsChunks) {
+            chunk.used = 0;
+        }
+    }
+
+    void WebGPUCommandList::end() {
+        assert(encoder != nullptr);
+
+        endRenderPass();
+
+        // The push constants recorded into this list reach the GPU before it is submitted.
+        for (uint32_t i = 0; i <= pushConstantsChunkIndex && i < pushConstantsChunks.size(); i++) {
+            PushConstantsChunk &chunk = pushConstantsChunks[i];
+            if (chunk.used > 0) {
+                wgpuQueueWriteBuffer(device->queue, chunk.buffer, 0, chunk.data.data(), chunk.used);
+            }
+        }
+
+        commandBuffer = wgpuCommandEncoderFinish(encoder, nullptr);
+        wgpuCommandEncoderRelease(encoder);
+        encoder = nullptr;
+    }
+
+    void WebGPUCommandList::barriers(RenderBarrierStages stages, const RenderBufferBarrier *bufferBarriers, uint32_t bufferBarriersCount, const RenderTextureBarrier *textureBarriers, uint32_t textureBarriersCount) {
+        // WebGPU tracks usage itself. A barrier usually means a pass's output is about to be read, which can't
+        // happen inside the pass, so it ends the render pass.
+        endRenderPass();
+    }
+
+    void WebGPUCommandList::dispatch(uint32_t threadGroupCountX, uint32_t threadGroupCountY, uint32_t threadGroupCountZ) {
+        assert((pipeline != nullptr) && (pipeline->type == WebGPUPipeline::Type::Compute));
+
+        endRenderPass();
+        WGPUPipelineLayout layout = resolveBindings(compute);
+        WGPUComputePassEncoder computePass = wgpuCommandEncoderBeginComputePass(encoder, nullptr);
+        wgpuComputePassEncoderSetPipeline(computePass, const_cast<WebGPUComputePipeline *>(static_cast<const WebGPUComputePipeline *>(pipeline))->get(layout));
+        bindGroups(compute, nullptr, computePass);
+        wgpuComputePassEncoderDispatchWorkgroups(computePass, threadGroupCountX, threadGroupCountY, threadGroupCountZ);
+        wgpuComputePassEncoderEnd(computePass);
+        wgpuComputePassEncoderRelease(computePass);
+    }
+
+    void WebGPUCommandList::traceRays(uint32_t width, uint32_t height, uint32_t depth, RenderBufferReference shaderBindingTable, const RenderShaderBindingGroupsInfo &shaderBindingGroupsInfo) {
+        assert(false && "WebGPU has no raytracing.");
+    }
+
+    // The bind group layouts of the bound descriptor sets, and the push constants in group 3, make the pipeline layout.
+    WGPUPipelineLayout WebGPUCommandList::resolveBindings(BindState &state) {
+        assert(state.layout != nullptr);
+
+        std::vector<WGPUBindGroupLayout> layouts;
+        for (uint32_t i = 0; i < state.layout->descriptorSetCount; i++) {
+            WebGPUDescriptorSet *descriptorSet = state.descriptorSets[i];
+            if (descriptorSet != nullptr) {
+                descriptorSet->update();
+                layouts.emplace_back(descriptorSet->layout);
+            }
+            else {
+                layouts.emplace_back(device->emptyLayout);
+            }
+        }
+
+        if (state.layout->pushConstantsSize > 0) {
+            while (layouts.size() < PushConstantsGroup) {
+                layouts.emplace_back(device->emptyLayout);
+            }
+
+            layouts.emplace_back(device->pushConstantsLayout);
+        }
+
+        return device->getPipelineLayout(layouts);
+    }
+
+    void WebGPUCommandList::bindGroups(BindState &state, WGPURenderPassEncoder renderPass, WGPUComputePassEncoder computePass) {
+        auto setBindGroup = [&](uint32_t groupIndex, WGPUBindGroup bindGroup, uint32_t offsetCount, const uint32_t *offsets) {
+            if (renderPass != nullptr) {
+                wgpuRenderPassEncoderSetBindGroup(renderPass, groupIndex, bindGroup, offsetCount, offsets);
+            }
+            else {
+                wgpuComputePassEncoderSetBindGroup(computePass, groupIndex, bindGroup, offsetCount, offsets);
+            }
+        };
+
+        // An unbound set still needs a group in its slot.
+        for (uint32_t i = 0; i < state.layout->descriptorSetCount; i++) {
+            WebGPUDescriptorSet *descriptorSet = state.descriptorSets[i];
+            setBindGroup(i, (descriptorSet != nullptr) ? descriptorSet->bindGroup : device->emptyBindGroup, 0, nullptr);
+        }
+
+        const uint32_t pushConstantsSize = state.layout->pushConstantsSize;
+        if (pushConstantsSize == 0) {
+            return;
+        }
+
+        for (uint32_t i = state.layout->descriptorSetCount; i < PushConstantsGroup; i++) {
+            setBindGroup(i, device->emptyBindGroup, 0, nullptr);
+        }
+
+        // Every draw or dispatch gets its own copy of the block in the ring.
+        const uint32_t slotSize = uint32_t(alignUp(pushConstantsSize, PushConstantsAlignment));
+        assert(slotSize <= PushConstantsChunkSize);
+        if ((pushConstantsChunkIndex < pushConstantsChunks.size()) && (pushConstantsChunks[pushConstantsChunkIndex].used + slotSize > PushConstantsChunkSize)) {
+            pushConstantsChunkIndex++;
+        }
+
+        if (pushConstantsChunkIndex >= pushConstantsChunks.size()) {
+            PushConstantsChunk chunk;
+            WGPUBufferDescriptor bufferDesc = WGPU_BUFFER_DESCRIPTOR_INIT;
+            bufferDesc.size = PushConstantsChunkSize;
+            bufferDesc.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
+            chunk.buffer = wgpuDeviceCreateBuffer(device->device, &bufferDesc);
+            chunk.data.resize(PushConstantsChunkSize, 0);
+            pushConstantsChunks.emplace_back(std::move(chunk));
+        }
+
+        // The binding's size is part of the bind group, so a chunk keeps one group per block size.
+        PushConstantsChunk &chunk = pushConstantsChunks[pushConstantsChunkIndex];
+        const uint32_t bindingSize = uint32_t(alignUp(pushConstantsSize, 16));
+        WGPUBindGroup &bindGroup = chunk.bindGroups[bindingSize];
+        if (bindGroup == nullptr) {
+            WGPUBindGroupEntry entry = WGPU_BIND_GROUP_ENTRY_INIT;
+            entry.binding = 0;
+            entry.buffer = chunk.buffer;
+            entry.offset = 0;
+            entry.size = bindingSize;
+            WGPUBindGroupDescriptor groupDesc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+            groupDesc.layout = device->pushConstantsLayout;
+            groupDesc.entryCount = 1;
+            groupDesc.entries = &entry;
+            bindGroup = wgpuDeviceCreateBindGroup(device->device, &groupDesc);
+        }
+
+        const uint32_t offset = chunk.used;
+        state.pushConstants.resize(pushConstantsSize, 0);
+        memcpy(chunk.data.data() + offset, state.pushConstants.data(), pushConstantsSize);
+        chunk.used += slotSize;
+        setBindGroup(PushConstantsGroup, bindGroup, 1, &offset);
+        state.pushConstantsDirty = false;
+    }
+
+    void WebGPUCommandList::endRenderPass() {
+        // Clears nothing was drawn after still need their pass.
+        const bool clearsPending = std::any_of(pendingColorClears.begin(), pendingColorClears.end(), [](const auto &clear) { return clear.first; }) || pendingDepthClear || pendingStencilClear;
+        if ((renderPass == nullptr) && clearsPending && (framebuffer != nullptr) && (encoder != nullptr)) {
+            beginRenderPass();
+        }
+
+        if (renderPass != nullptr) {
+            wgpuRenderPassEncoderEnd(renderPass);
+            wgpuRenderPassEncoderRelease(renderPass);
+            renderPass = nullptr;
+        }
+    }
+
+    bool WebGPUCommandList::beginRenderPass() {
+        if (renderPass != nullptr) {
+            return true;
+        }
+
+        if (framebuffer == nullptr) {
+            assert(false && "No framebuffer set.");
+            return false;
+        }
+
+        std::vector<WGPURenderPassColorAttachment> colorAttachments;
+        for (size_t i = 0; i < framebuffer->colorTextures.size(); i++) {
+            WGPURenderPassColorAttachment attachment = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+            const WebGPUTextureView *view = framebuffer->colorViews[i];
+            attachment.view = (view != nullptr) ? view->view : const_cast<WebGPUTexture *>(framebuffer->colorTextures[i])->getDefaultView();
+            attachment.storeOp = WGPUStoreOp_Store;
+            if ((i < pendingColorClears.size()) && pendingColorClears[i].first) {
+                const RenderColor &color = pendingColorClears[i].second;
+                attachment.loadOp = WGPULoadOp_Clear;
+                attachment.clearValue = { color.r, color.g, color.b, color.a };
+            }
+            else {
+                attachment.loadOp = WGPULoadOp_Load;
+            }
+
+            colorAttachments.emplace_back(attachment);
+        }
+
+        WGPURenderPassDepthStencilAttachment depthAttachment = WGPU_RENDER_PASS_DEPTH_STENCIL_ATTACHMENT_INIT;
+        WGPURenderPassDescriptor passDesc = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+        if (framebuffer->depthTexture != nullptr) {
+            const RenderFormat depthFormat = framebuffer->depthTexture->desc.format;
+            depthAttachment.view = (framebuffer->depthView != nullptr) ? framebuffer->depthView->view : const_cast<WebGPUTexture *>(framebuffer->depthTexture)->getDefaultView();
+            if (framebuffer->depthReadOnly) {
+                depthAttachment.depthReadOnly = true;
+            }
+            else {
+                depthAttachment.depthLoadOp = pendingDepthClear ? WGPULoadOp_Clear : WGPULoadOp_Load;
+                depthAttachment.depthStoreOp = WGPUStoreOp_Store;
+                depthAttachment.depthClearValue = pendingDepthValue;
+            }
+
+            if (RenderFormatIsStencil(depthFormat)) {
+                if (framebuffer->depthReadOnly) {
+                    depthAttachment.stencilReadOnly = true;
+                }
+                else {
+                    depthAttachment.stencilLoadOp = pendingStencilClear ? WGPULoadOp_Clear : WGPULoadOp_Load;
+                    depthAttachment.stencilStoreOp = WGPUStoreOp_Store;
+                    depthAttachment.stencilClearValue = pendingStencilValue;
+                }
+            }
+
+            passDesc.depthStencilAttachment = &depthAttachment;
+        }
+
+        passDesc.colorAttachmentCount = colorAttachments.size();
+        passDesc.colorAttachments = colorAttachments.data();
+        renderPass = wgpuCommandEncoderBeginRenderPass(encoder, &passDesc);
+        pendingColorClears.clear();
+        pendingDepthClear = false;
+        pendingStencilClear = false;
+        renderStateDirty = true;
+        return true;
+    }
+
+    bool WebGPUCommandList::prepareDraw() {
+        if (!beginRenderPass()) {
+            return false;
+        }
+
+        assert((pipeline != nullptr) && (pipeline->type == WebGPUPipeline::Type::Graphics));
+        WGPUPipelineLayout layout = resolveBindings(graphics);
+        wgpuRenderPassEncoderSetPipeline(renderPass, const_cast<WebGPUGraphicsPipeline *>(static_cast<const WebGPUGraphicsPipeline *>(pipeline))->get(layout));
+        bindGroups(graphics, renderPass, nullptr);
+
+        if (renderStateDirty) {
+            for (uint32_t i = 0; i < vertexBufferCount; i++) {
+                const RenderVertexBufferView &view = vertexBuffers[i];
+                if (view.buffer.ref != nullptr) {
+                    const WebGPUBuffer *buffer = static_cast<const WebGPUBuffer *>(view.buffer.ref);
+                    wgpuRenderPassEncoderSetVertexBuffer(renderPass, i, buffer->buffer, view.buffer.offset, view.size);
+                }
+            }
+
+            if (indexBuffer.buffer.ref != nullptr) {
+                const WebGPUBuffer *buffer = static_cast<const WebGPUBuffer *>(indexBuffer.buffer.ref);
+                wgpuRenderPassEncoderSetIndexBuffer(renderPass, buffer->buffer, toIndexFormat(indexBuffer.format), indexBuffer.buffer.offset, indexBuffer.size);
+            }
+
+            if (viewportSet) {
+                wgpuRenderPassEncoderSetViewport(renderPass, viewport.x, viewport.y, viewport.width, viewport.height, viewport.minDepth, viewport.maxDepth);
+            }
+
+            // The scissor has to lie inside the attachments.
+            RenderRect rect = scissorSet ? scissor : RenderRect(0, 0, framebuffer->width, framebuffer->height);
+            rect.left = std::clamp<int32_t>(rect.left, 0, framebuffer->width);
+            rect.top = std::clamp<int32_t>(rect.top, 0, framebuffer->height);
+            rect.right = std::clamp<int32_t>(rect.right, rect.left, framebuffer->width);
+            rect.bottom = std::clamp<int32_t>(rect.bottom, rect.top, framebuffer->height);
+            wgpuRenderPassEncoderSetScissorRect(renderPass, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top);
+            renderStateDirty = false;
+        }
+
+        return true;
+    }
+
+    void WebGPUCommandList::drawInstanced(uint32_t vertexCountPerInstance, uint32_t instanceCount, uint32_t startVertexLocation, uint32_t startInstanceLocation) {
+        if (prepareDraw()) {
+            wgpuRenderPassEncoderDraw(renderPass, vertexCountPerInstance, instanceCount, startVertexLocation, startInstanceLocation);
+        }
+    }
+
+    void WebGPUCommandList::drawIndexedInstanced(uint32_t indexCountPerInstance, uint32_t instanceCount, uint32_t startIndexLocation, int32_t baseVertexLocation, uint32_t startInstanceLocation) {
+        if (prepareDraw()) {
+            wgpuRenderPassEncoderDrawIndexed(renderPass, indexCountPerInstance, instanceCount, startIndexLocation, baseVertexLocation, startInstanceLocation);
+        }
+    }
+
+    void WebGPUCommandList::setPipeline(const RenderPipeline *pipeline) {
+        this->pipeline = static_cast<const WebGPUPipeline *>(pipeline);
+    }
+
+    void WebGPUCommandList::setComputePipelineLayout(const RenderPipelineLayout *pipelineLayout) {
+        compute.layout = static_cast<const WebGPUPipelineLayout *>(pipelineLayout);
+    }
+
+    void WebGPUCommandList::setPushConstants(BindState &state, uint32_t rangeIndex, const void *data, uint32_t offset, uint32_t size) {
+        assert(state.layout != nullptr);
+        assert(rangeIndex < state.layout->pushConstantRanges.size());
+
+        const RenderPushConstantRange &range = state.layout->pushConstantRanges[rangeIndex];
+        const uint32_t copySize = (size == 0) ? range.size : size;
+        assert(offset + copySize <= range.size);
+        state.pushConstants.resize(state.layout->pushConstantsSize, 0);
+        memcpy(state.pushConstants.data() + range.offset + offset, data, copySize);
+        state.pushConstantsDirty = true;
+    }
+
+    void WebGPUCommandList::setComputePushConstants(uint32_t rangeIndex, const void *data, uint32_t offset, uint32_t size) {
+        setPushConstants(compute, rangeIndex, data, offset, size);
+    }
+
+    void WebGPUCommandList::setComputeDescriptorSet(RenderDescriptorSet *descriptorSet, uint32_t setIndex) {
+        assert(setIndex < MaxDescriptorSets);
+        compute.descriptorSets[setIndex] = static_cast<WebGPUDescriptorSet *>(descriptorSet);
+    }
+
+    void WebGPUCommandList::setGraphicsPipelineLayout(const RenderPipelineLayout *pipelineLayout) {
+        graphics.layout = static_cast<const WebGPUPipelineLayout *>(pipelineLayout);
+    }
+
+    void WebGPUCommandList::setGraphicsPushConstants(uint32_t rangeIndex, const void *data, uint32_t offset, uint32_t size) {
+        setPushConstants(graphics, rangeIndex, data, offset, size);
+    }
+
+    void WebGPUCommandList::setGraphicsDescriptorSet(RenderDescriptorSet *descriptorSet, uint32_t setIndex) {
+        assert(setIndex < MaxDescriptorSets);
+        graphics.descriptorSets[setIndex] = static_cast<WebGPUDescriptorSet *>(descriptorSet);
+    }
+
+    void WebGPUCommandList::setGraphicsRootDescriptor(RenderBufferReference bufferReference, uint32_t rootDescriptorIndex) {
+        assert(false && "Root descriptors are D3D12 only.");
+    }
+
+    void WebGPUCommandList::setRaytracingPipelineLayout(const RenderPipelineLayout *pipelineLayout) {
+        assert(false && "WebGPU has no raytracing.");
+    }
+
+    void WebGPUCommandList::setRaytracingPushConstants(uint32_t rangeIndex, const void *data, uint32_t offset, uint32_t size) {
+        assert(false && "WebGPU has no raytracing.");
+    }
+
+    void WebGPUCommandList::setRaytracingDescriptorSet(RenderDescriptorSet *descriptorSet, uint32_t setIndex) {
+        assert(false && "WebGPU has no raytracing.");
+    }
+
+    void WebGPUCommandList::setIndexBuffer(const RenderIndexBufferView *view) {
+        indexBuffer = (view != nullptr) ? *view : RenderIndexBufferView();
+        renderStateDirty = true;
+    }
+
+    void WebGPUCommandList::setVertexBuffers(uint32_t startSlot, const RenderVertexBufferView *views, uint32_t viewCount, const RenderInputSlot *inputSlots) {
+        assert(startSlot + viewCount <= MaxVertexBuffers);
+
+        for (uint32_t i = 0; i < viewCount; i++) {
+            vertexBuffers[startSlot + i] = views[i];
+        }
+
+        vertexBufferCount = std::max(vertexBufferCount, startSlot + viewCount);
+        renderStateDirty = true;
+    }
+
+    void WebGPUCommandList::setViewports(const RenderViewport *viewports, uint32_t count) {
+        if (count > 1) {
+            PLUME_WEBGPU_UNSUPPORTED("only the first of several viewports is used");
+        }
+
+        if (count > 0) {
+            viewport = viewports[0];
+            viewportSet = true;
+            renderStateDirty = true;
+        }
+    }
+
+    void WebGPUCommandList::setScissors(const RenderRect *scissorRects, uint32_t count) {
+        if (count > 1) {
+            PLUME_WEBGPU_UNSUPPORTED("only the first of several scissors is used");
+        }
+
+        if (count > 0) {
+            scissor = scissorRects[0];
+            scissorSet = true;
+            renderStateDirty = true;
+        }
+    }
+
+    void WebGPUCommandList::setFramebuffer(const RenderFramebuffer *framebuffer) {
+        endRenderPass();
+        this->framebuffer = static_cast<const WebGPUFramebuffer *>(framebuffer);
+        pendingColorClears.clear();
+        pendingDepthClear = false;
+        pendingStencilClear = false;
+    }
+
+    void WebGPUCommandList::setDepthBias(float depthBias, float depthBiasClamp, float slopeScaledDepthBias) {
+        PLUME_WEBGPU_UNSUPPORTED("dynamic depth bias is ignored");
+    }
+
+    static bool coversFramebuffer(const WebGPUFramebuffer *framebuffer, const RenderRect *clearRects, uint32_t clearRectsCount) {
+        if (clearRectsCount == 0) {
+            return true;
+        }
+
+        for (uint32_t i = 0; i < clearRectsCount; i++) {
+            const RenderRect &rect = clearRects[i];
+            if ((rect.left <= 0) && (rect.top <= 0) && (rect.right >= int32_t(framebuffer->width)) && (rect.bottom >= int32_t(framebuffer->height))) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // A clear becomes the load op of the next render pass, so a pass already open is ended first.
+    void WebGPUCommandList::clearColor(uint32_t attachmentIndex, RenderColor colorValue, const RenderRect *clearRects, uint32_t clearRectsCount) {
+        assert(framebuffer != nullptr);
+
+        if (!coversFramebuffer(framebuffer, clearRects, clearRectsCount)) {
+            PLUME_WEBGPU_UNSUPPORTED("clears of part of a framebuffer are ignored");
+            return;
+        }
+
+        if (renderPass != nullptr) {
+            endRenderPass();
+        }
+        if (pendingColorClears.size() <= attachmentIndex) {
+            pendingColorClears.resize(attachmentIndex + 1, { false, RenderColor() });
+        }
+
+        pendingColorClears[attachmentIndex] = { true, colorValue };
+    }
+
+    void WebGPUCommandList::clearDepthStencil(bool clearDepth, bool clearStencil, float depthValue, uint32_t stencilValue, const RenderRect *clearRects, uint32_t clearRectsCount) {
+        assert(framebuffer != nullptr);
+
+        if (!coversFramebuffer(framebuffer, clearRects, clearRectsCount)) {
+            PLUME_WEBGPU_UNSUPPORTED("clears of part of a framebuffer are ignored");
+            return;
+        }
+
+        if (renderPass != nullptr) {
+            endRenderPass();
+        }
+        if (clearDepth) {
+            pendingDepthClear = true;
+            pendingDepthValue = depthValue;
+        }
+
+        if (clearStencil) {
+            pendingStencilClear = true;
+            pendingStencilValue = stencilValue;
+        }
+    }
+
+    void WebGPUCommandList::copyBufferRegion(RenderBufferReference dstBuffer, RenderBufferReference srcBuffer, uint64_t size) {
+        endRenderPass();
+        const WebGPUBuffer *dst = static_cast<const WebGPUBuffer *>(dstBuffer.ref);
+        const WebGPUBuffer *src = static_cast<const WebGPUBuffer *>(srcBuffer.ref);
+        wgpuCommandEncoderCopyBufferToBuffer(encoder, src->buffer, srcBuffer.offset, dst->buffer, dstBuffer.offset, size);
+    }
+
+    void WebGPUCommandList::copyTextureRegion(const RenderTextureCopyLocation &dstLocation, const RenderTextureCopyLocation &srcLocation, uint32_t dstX, uint32_t dstY, uint32_t dstZ, const RenderBox *srcBox) {
+        endRenderPass();
+
+        auto textureInfo = [](const RenderTextureCopyLocation &location, uint32_t x, uint32_t y, uint32_t z) {
+            const WebGPUTexture *texture = static_cast<const WebGPUTexture *>(location.texture);
+            WGPUTexelCopyTextureInfo info = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+            info.texture = texture->texture;
+            info.mipLevel = location.subresource.mipLevel;
+            info.origin = { x, y, (texture->desc.dimension == RenderTextureDimension::TEXTURE_3D) ? z : location.subresource.arrayIndex + z };
+            if (RenderFormatIsDepth(texture->desc.format) && RenderFormatIsStencil(texture->desc.format)) {
+                info.aspect = WGPUTextureAspect_DepthOnly;
+            }
+
+            return info;
+        };
+
+        auto bufferInfo = [](const RenderTextureCopyLocation &location) {
+            const WebGPUBuffer *buffer = static_cast<const WebGPUBuffer *>(location.buffer);
+            uint32_t bytesPerRow, rows;
+            copyFootprint(location.placedFootprint.format, location.placedFootprint.rowWidth, location.placedFootprint.height, bytesPerRow, rows);
+            WGPUTexelCopyBufferInfo info = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
+            info.buffer = buffer->buffer;
+            info.layout.offset = location.placedFootprint.offset;
+            info.layout.bytesPerRow = bytesPerRow;
+            info.layout.rowsPerImage = rows;
+            return info;
+        };
+
+        const bool srcIsTexture = srcLocation.type == RenderTextureCopyType::SUBRESOURCE;
+        const bool dstIsTexture = dstLocation.type == RenderTextureCopyType::SUBRESOURCE;
+        WGPUExtent3D extent = {};
+        if (srcIsTexture) {
+            const WebGPUTexture *texture = static_cast<const WebGPUTexture *>(srcLocation.texture);
+            const uint32_t mip = srcLocation.subresource.mipLevel;
+            extent = { std::max(texture->desc.width >> mip, 1U), std::max(texture->desc.height >> mip, 1U), 1 };
+            if (texture->desc.dimension == RenderTextureDimension::TEXTURE_3D) {
+                extent.depthOrArrayLayers = std::max(texture->desc.depth >> mip, 1U);
+            }
+        }
+        else {
+            extent = { srcLocation.placedFootprint.width, srcLocation.placedFootprint.height, std::max(srcLocation.placedFootprint.depth, 1U) };
+        }
+
+        uint32_t srcX = 0, srcY = 0, srcZ = 0;
+        if (srcBox != nullptr) {
+            srcX = srcBox->left;
+            srcY = srcBox->top;
+            srcZ = srcBox->front;
+            extent = { uint32_t(srcBox->right - srcBox->left), uint32_t(srcBox->bottom - srcBox->top), uint32_t(std::max(srcBox->back - srcBox->front, 1)) };
+        }
+
+        if (!srcIsTexture && dstIsTexture) {
+            WGPUTexelCopyBufferInfo src = bufferInfo(srcLocation);
+            WGPUTexelCopyTextureInfo dst = textureInfo(dstLocation, dstX, dstY, dstZ);
+            wgpuCommandEncoderCopyBufferToTexture(encoder, &src, &dst, &extent);
+        }
+        else if (srcIsTexture && !dstIsTexture) {
+            WGPUTexelCopyTextureInfo src = textureInfo(srcLocation, srcX, srcY, srcZ);
+            WGPUTexelCopyBufferInfo dst = bufferInfo(dstLocation);
+            wgpuCommandEncoderCopyTextureToBuffer(encoder, &src, &dst, &extent);
+        }
+        else if (srcIsTexture && dstIsTexture) {
+            WGPUTexelCopyTextureInfo src = textureInfo(srcLocation, srcX, srcY, srcZ);
+            WGPUTexelCopyTextureInfo dst = textureInfo(dstLocation, dstX, dstY, dstZ);
+            wgpuCommandEncoderCopyTextureToTexture(encoder, &src, &dst, &extent);
+        }
+        else {
+            assert(false && "A copy needs a texture on at least one side.");
+        }
+    }
+
+    void WebGPUCommandList::copyBuffer(const RenderBuffer *dstBuffer, const RenderBuffer *srcBuffer) {
+        endRenderPass();
+        const WebGPUBuffer *dst = static_cast<const WebGPUBuffer *>(dstBuffer);
+        const WebGPUBuffer *src = static_cast<const WebGPUBuffer *>(srcBuffer);
+        wgpuCommandEncoderCopyBufferToBuffer(encoder, src->buffer, 0, dst->buffer, 0, alignUp(std::min(dst->desc.size, src->desc.size), 4));
+    }
+
+    void WebGPUCommandList::copyTexture(const RenderTexture *dstTexture, const RenderTexture *srcTexture) {
+        endRenderPass();
+        const WebGPUTexture *dst = static_cast<const WebGPUTexture *>(dstTexture);
+        const WebGPUTexture *src = static_cast<const WebGPUTexture *>(srcTexture);
+        const RenderTextureDesc &desc = src->desc;
+        const uint32_t layers = (desc.dimension == RenderTextureDimension::TEXTURE_3D) ? std::max(desc.depth, 1U) : std::max(desc.arraySize, 1U);
+        for (uint32_t mip = 0; mip < std::max(desc.mipLevels, 1U); mip++) {
+            WGPUTexelCopyTextureInfo srcInfo = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+            srcInfo.texture = src->texture;
+            srcInfo.mipLevel = mip;
+            WGPUTexelCopyTextureInfo dstInfo = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+            dstInfo.texture = dst->texture;
+            dstInfo.mipLevel = mip;
+            WGPUExtent3D extent = { std::max(desc.width >> mip, 1U), std::max(desc.height >> mip, 1U), (desc.dimension == RenderTextureDimension::TEXTURE_3D) ? std::max(layers >> mip, 1U) : layers };
+            wgpuCommandEncoderCopyTextureToTexture(encoder, &srcInfo, &dstInfo, &extent);
+        }
+    }
+
+    // WebGPU resolves only at the end of a render pass, so a resolve is a pass that loads the multisampled texture
+    // and draws nothing.
+    void WebGPUCommandList::resolveTexture(const RenderTexture *dstTexture, const RenderTexture *srcTexture) {
+        endRenderPass();
+        WebGPUTexture *dst = const_cast<WebGPUTexture *>(static_cast<const WebGPUTexture *>(dstTexture));
+        WebGPUTexture *src = const_cast<WebGPUTexture *>(static_cast<const WebGPUTexture *>(srcTexture));
+        WGPURenderPassColorAttachment attachment = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+        attachment.view = src->getDefaultView();
+        attachment.resolveTarget = dst->getDefaultView();
+        attachment.loadOp = WGPULoadOp_Load;
+        attachment.storeOp = WGPUStoreOp_Store;
+        WGPURenderPassDescriptor passDesc = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+        passDesc.colorAttachmentCount = 1;
+        passDesc.colorAttachments = &attachment;
+        WGPURenderPassEncoder resolvePass = wgpuCommandEncoderBeginRenderPass(encoder, &passDesc);
+        wgpuRenderPassEncoderEnd(resolvePass);
+        wgpuRenderPassEncoderRelease(resolvePass);
+    }
+
+    void WebGPUCommandList::resolveTextureRegion(const RenderTexture *dstTexture, uint32_t dstX, uint32_t dstY, const RenderTexture *srcTexture, const RenderRect *srcRect, RenderResolveMode resolveMode) {
+        if ((dstX == 0) && (dstY == 0) && (srcRect == nullptr) && (resolveMode == RenderResolveMode::AVERAGE)) {
+            resolveTexture(dstTexture, srcTexture);
+        }
+        else {
+            PLUME_WEBGPU_UNSUPPORTED("resolving part of a texture, or not by averaging, is ignored");
+        }
+    }
+
+    void WebGPUCommandList::buildBottomLevelAS(const RenderAccelerationStructure *dstAccelerationStructure, RenderBufferReference scratchBuffer, const RenderBottomLevelASBuildInfo &buildInfo) {
+        assert(false && "WebGPU has no raytracing.");
+    }
+
+    void WebGPUCommandList::buildTopLevelAS(const RenderAccelerationStructure *dstAccelerationStructure, RenderBufferReference scratchBuffer, RenderBufferReference instancesBuffer, const RenderTopLevelASBuildInfo &buildInfo) {
+        assert(false && "WebGPU has no raytracing.");
+    }
+
+    void WebGPUCommandList::discardTexture(const RenderTexture *texture) { }
+
+    void WebGPUCommandList::resetQueryPool(const RenderQueryPool *queryPool, uint32_t queryFirstIndex, uint32_t queryCount) { }
+
+    void WebGPUCommandList::writeTimestamp(const RenderQueryPool *queryPool, uint32_t queryIndex) { }
+
+    // WebGPUCommandQueue
+
+    WebGPUCommandQueue::WebGPUCommandQueue(WebGPUDevice *device) {
+        assert(device != nullptr);
+
+        this->device = device;
+    }
+
+    WebGPUCommandQueue::~WebGPUCommandQueue() { }
+
+    std::unique_ptr<RenderCommandList> WebGPUCommandQueue::createCommandList() {
+        return std::make_unique<WebGPUCommandList>(device);
+    }
+
+    std::unique_ptr<RenderSwapChain> WebGPUCommandQueue::createSwapChain(const RenderSwapChainDesc &desc) {
+        return std::make_unique<WebGPUSwapChain>(this, desc);
+    }
+
+    void WebGPUCommandQueue::executeCommandLists(const RenderCommandList **commandLists, uint32_t commandListCount, RenderCommandSemaphore **waitSemaphores, uint32_t waitSemaphoreCount, RenderCommandSemaphore **signalSemaphores, uint32_t signalSemaphoreCount, RenderCommandFence *signalFence) {
+        device->flushMappedBuffers();
+
+        std::vector<WGPUCommandBuffer> commandBuffers;
+        for (uint32_t i = 0; i < commandListCount; i++) {
+            WebGPUCommandList *commandList = const_cast<WebGPUCommandList *>(static_cast<const WebGPUCommandList *>(commandLists[i]));
+            assert(commandList->commandBuffer != nullptr && "The command list wasn't ended, or was already executed.");
+            commandBuffers.emplace_back(commandList->commandBuffer);
+        }
+
+        wgpuQueueSubmit(device->queue, commandBuffers.size(), commandBuffers.data());
+
+        for (uint32_t i = 0; i < commandListCount; i++) {
+            WebGPUCommandList *commandList = const_cast<WebGPUCommandList *>(static_cast<const WebGPUCommandList *>(commandLists[i]));
+            wgpuCommandBufferRelease(commandList->commandBuffer);
+            commandList->commandBuffer = nullptr;
+        }
+    }
+
+    void WebGPUCommandQueue::waitForCommandFence(RenderCommandFence *fence) {
+        // Nothing to wait for: see plume_webgpu.h.
+    }
+
+    // WebGPUPool
+
+    WebGPUPool::WebGPUPool(WebGPUDevice *device, const RenderPoolDesc &desc) {
+        assert(device != nullptr);
+
+        this->device = device;
+        this->desc = desc;
+    }
+
+    WebGPUPool::~WebGPUPool() { }
+
+    std::unique_ptr<RenderBuffer> WebGPUPool::createBuffer(const RenderBufferDesc &desc) {
+        return std::make_unique<WebGPUBuffer>(device, this, desc);
+    }
+
+    std::unique_ptr<RenderTexture> WebGPUPool::createTexture(const RenderTextureDesc &desc) {
+        return std::make_unique<WebGPUTexture>(device, this, desc);
+    }
+
+    // WebGPUQueryPool
+
+    WebGPUQueryPool::WebGPUQueryPool(uint32_t queryCount) {
+        results.resize(queryCount, 0);
+    }
+
+    WebGPUQueryPool::~WebGPUQueryPool() { }
+
+    void WebGPUQueryPool::queryResults() { }
+
+    const uint64_t *WebGPUQueryPool::getResults() const {
+        return results.data();
+    }
+
+    uint32_t WebGPUQueryPool::getCount() const {
+        return uint32_t(results.size());
+    }
+
+    // WebGPUDevice
+
+    WebGPUDevice::WebGPUDevice(WebGPUInterface *renderInterface) {
+        assert(renderInterface != nullptr);
+
+        this->renderInterface = renderInterface;
+        device = emscripten_webgpu_get_device();
+        if (device == nullptr) {
+            fprintf(stderr, "plume WebGPU: no device; the page must set Module.preinitializedWebGPUDevice.\n");
+            return;
+        }
+
+        queue = wgpuDeviceGetQueue(device);
+        float32Filterable = wgpuDeviceHasFeature(device, WGPUFeatureName_Float32Filterable);
+        depthClipControl = wgpuDeviceHasFeature(device, WGPUFeatureName_DepthClipControl);
+
+        WGPULimits limits = WGPU_LIMITS_INIT;
+        wgpuDeviceGetLimits(device, &limits);
+        capabilities.maxTextureSize = limits.maxTextureDimension2D;
+
+        emptyLayout = getBindGroupLayout("", {});
+        WGPUBindGroupDescriptor emptyGroupDesc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+        emptyGroupDesc.layout = emptyLayout;
+        emptyBindGroup = wgpuDeviceCreateBindGroup(device, &emptyGroupDesc);
+
+        WGPUBindGroupLayoutEntry pushConstantsEntry = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+        pushConstantsEntry.binding = 0;
+        pushConstantsEntry.visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment | WGPUShaderStage_Compute;
+        pushConstantsEntry.buffer.type = WGPUBufferBindingType_Uniform;
+        pushConstantsEntry.buffer.hasDynamicOffset = true;
+        pushConstantsLayout = getBindGroupLayout("pushConstants", { pushConstantsEntry });
+        capabilities.triangleFan = false;
+        capabilities.dynamicDepthBias = false;
+        capabilities.queryPools = false;
+        description.name = "WebGPU";
+    }
+
+    WebGPUDevice::~WebGPUDevice() {
+        if (emptyBindGroup != nullptr) {
+            wgpuBindGroupRelease(emptyBindGroup);
+        }
+
+        for (auto &it : pipelineLayouts) {
+            wgpuPipelineLayoutRelease(it.second);
+        }
+
+        for (auto &it : bindGroupLayouts) {
+            wgpuBindGroupLayoutRelease(it.second);
+        }
+
+        if (queue != nullptr) {
+            wgpuQueueRelease(queue);
+        }
+
+        if (device != nullptr) {
+            wgpuDeviceRelease(device);
+        }
+    }
+
+    WGPUBindGroupLayout WebGPUDevice::getBindGroupLayout(const std::string &key, const std::vector<WGPUBindGroupLayoutEntry> &entries) {
+        auto it = bindGroupLayouts.find(key);
+        if (it != bindGroupLayouts.end()) {
+            return it->second;
+        }
+
+        WGPUBindGroupLayoutDescriptor layoutDesc = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+        layoutDesc.entryCount = entries.size();
+        layoutDesc.entries = entries.data();
+        WGPUBindGroupLayout layout = wgpuDeviceCreateBindGroupLayout(device, &layoutDesc);
+        bindGroupLayouts[key] = layout;
+        return layout;
+    }
+
+    WGPUPipelineLayout WebGPUDevice::getPipelineLayout(const std::vector<WGPUBindGroupLayout> &layouts) {
+        auto it = pipelineLayouts.find(layouts);
+        if (it != pipelineLayouts.end()) {
+            return it->second;
+        }
+
+        WGPUPipelineLayoutDescriptor layoutDesc = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+        layoutDesc.bindGroupLayoutCount = layouts.size();
+        layoutDesc.bindGroupLayouts = layouts.data();
+        WGPUPipelineLayout layout = wgpuDeviceCreatePipelineLayout(device, &layoutDesc);
+        pipelineLayouts[layouts] = layout;
+        return layout;
+    }
+
+    void WebGPUDevice::flushMappedBuffers() {
+        for (WebGPUBuffer *buffer : mappedBuffers) {
+            buffer->flush(0, buffer->shadow.size());
+        }
+    }
+
+    std::unique_ptr<RenderDescriptorSet> WebGPUDevice::createDescriptorSet(const RenderDescriptorSetDesc &desc) {
+        return std::make_unique<WebGPUDescriptorSet>(this, desc);
+    }
+
+    std::unique_ptr<RenderShader> WebGPUDevice::createShader(const void *data, uint64_t size, const char *entryPointName, RenderShaderFormat format) {
+        return std::make_unique<WebGPUShader>(this, data, size, entryPointName, format);
+    }
+
+    std::unique_ptr<RenderSampler> WebGPUDevice::createSampler(const RenderSamplerDesc &desc) {
+        return std::make_unique<WebGPUSampler>(this, desc);
+    }
+
+    std::unique_ptr<RenderPipeline> WebGPUDevice::createComputePipeline(const RenderComputePipelineDesc &desc) {
+        return std::make_unique<WebGPUComputePipeline>(this, desc);
+    }
+
+    std::unique_ptr<RenderPipeline> WebGPUDevice::createGraphicsPipeline(const RenderGraphicsPipelineDesc &desc) {
+        return std::make_unique<WebGPUGraphicsPipeline>(this, desc);
+    }
+
+    std::unique_ptr<RenderPipeline> WebGPUDevice::createRaytracingPipeline(const RenderRaytracingPipelineDesc &desc, const RenderPipeline *previousPipeline) {
+        assert(false && "WebGPU has no raytracing.");
+        return nullptr;
+    }
+
+    std::unique_ptr<RenderCommandQueue> WebGPUDevice::createCommandQueue(RenderCommandListType type) {
+        // WebGPU has one queue; every plume queue submits to it.
+        return std::make_unique<WebGPUCommandQueue>(this);
+    }
+
+    std::unique_ptr<RenderBuffer> WebGPUDevice::createBuffer(const RenderBufferDesc &desc) {
+        return std::make_unique<WebGPUBuffer>(this, nullptr, desc);
+    }
+
+    std::unique_ptr<RenderTexture> WebGPUDevice::createTexture(const RenderTextureDesc &desc) {
+        return std::make_unique<WebGPUTexture>(this, nullptr, desc);
+    }
+
+    std::unique_ptr<RenderAccelerationStructure> WebGPUDevice::createAccelerationStructure(const RenderAccelerationStructureDesc &desc) {
+        assert(false && "WebGPU has no raytracing.");
+        return nullptr;
+    }
+
+    std::unique_ptr<RenderPool> WebGPUDevice::createPool(const RenderPoolDesc &desc) {
+        return std::make_unique<WebGPUPool>(this, desc);
+    }
+
+    std::unique_ptr<RenderPipelineLayout> WebGPUDevice::createPipelineLayout(const RenderPipelineLayoutDesc &desc) {
+        return std::make_unique<WebGPUPipelineLayout>(this, desc);
+    }
+
+    std::unique_ptr<RenderCommandFence> WebGPUDevice::createCommandFence() {
+        return std::make_unique<WebGPUCommandFence>();
+    }
+
+    std::unique_ptr<RenderCommandSemaphore> WebGPUDevice::createCommandSemaphore() {
+        return std::make_unique<WebGPUCommandSemaphore>();
+    }
+
+    std::unique_ptr<RenderFramebuffer> WebGPUDevice::createFramebuffer(const RenderFramebufferDesc &desc) {
+        return std::make_unique<WebGPUFramebuffer>(desc);
+    }
+
+    std::unique_ptr<RenderQueryPool> WebGPUDevice::createQueryPool(uint32_t queryCount) {
+        return std::make_unique<WebGPUQueryPool>(queryCount);
+    }
+
+    void WebGPUDevice::setBottomLevelASBuildInfo(RenderBottomLevelASBuildInfo &buildInfo, const RenderBottomLevelASMesh *meshes, uint32_t meshCount, bool preferFastBuild, bool preferFastTrace) {
+        assert(false && "WebGPU has no raytracing.");
+    }
+
+    void WebGPUDevice::setTopLevelASBuildInfo(RenderTopLevelASBuildInfo &buildInfo, const RenderTopLevelASInstance *instances, uint32_t instanceCount, bool preferFastBuild, bool preferFastTrace) {
+        assert(false && "WebGPU has no raytracing.");
+    }
+
+    void WebGPUDevice::setShaderBindingTableInfo(RenderShaderBindingTableInfo &tableInfo, const RenderShaderBindingGroups &groups, const RenderPipeline *pipeline, RenderDescriptorSet **descriptorSets, uint32_t descriptorSetCount) {
+        assert(false && "WebGPU has no raytracing.");
+    }
+
+    const RenderDeviceCapabilities &WebGPUDevice::getCapabilities() const {
+        return capabilities;
+    }
+
+    const RenderDeviceDescription &WebGPUDevice::getDescription() const {
+        return description;
+    }
+
+    RenderSampleCounts WebGPUDevice::getSampleCountsSupported(RenderFormat format) const {
+        // Core WebGPU guarantees 1 and 4 samples for every renderable format.
+        return RenderSampleCount::COUNT_1 | RenderSampleCount::COUNT_4;
+    }
+
+    bool WebGPUDevice::beginCapture() {
+        return false;
+    }
+
+    bool WebGPUDevice::endCapture() {
+        return false;
+    }
+
+    // WebGPUInterface
+
+    WebGPUInterface::WebGPUInterface() {
+        capabilities.shaderFormat = RenderShaderFormat::WGSL;
+        deviceNames.emplace_back("WebGPU");
+    }
+
+    WebGPUInterface::~WebGPUInterface() { }
+
+    std::unique_ptr<RenderDevice> WebGPUInterface::createDevice(const std::string &preferredDeviceName) {
+        auto createdDevice = std::make_unique<WebGPUDevice>(this);
+        return (createdDevice->device != nullptr) ? std::move(createdDevice) : nullptr;
+    }
+
+    const RenderInterfaceCapabilities &WebGPUInterface::getCapabilities() const {
+        return capabilities;
+    }
+
+    const std::vector<std::string> &WebGPUInterface::getDeviceNames() const {
+        return deviceNames;
+    }
+
+    bool WebGPUInterface::isValid() const {
+        return true;
+    }
+
+    std::unique_ptr<RenderInterface> CreateWebGPUInterface() {
+        return std::make_unique<WebGPUInterface>();
+    }
+};

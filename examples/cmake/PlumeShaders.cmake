@@ -8,7 +8,11 @@
 #   plume_compile_vertex_shader(my_target shaders/main.vert.hlsl mainVert VSMain)
 #   plume_compile_pixel_shader(my_target shaders/main.frag.hlsl mainFrag PSMain)
 #   plume_compile_compute_shader(my_target shaders/compute.hlsl computeShader CSMain)
+#
+# With Emscripten, HLSL becomes WGSL only (<name>BlobWGSL): dxc to SPIR-V, then naga (PLUME_NAGA_EXECUTABLE) and
+# PlumeWGSL.cmake. dxc runs on the host, so PLUME_DXC_EXECUTABLE must be given.
 
+set(PLUME_SHADERS_MODULE_DIR "${CMAKE_CURRENT_LIST_DIR}")
 include("${CMAKE_CURRENT_LIST_DIR}/modules/PlumeFileToC.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/modules/PlumeDXC.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/modules/PlumeSpirvCross.cmake")
@@ -32,6 +36,20 @@ function(_plume_embed TARGET_NAME INPUT_FILE VAR_NAME OUTPUT_C OUTPUT_H)
 endfunction()
 
 function(plume_shaders_init)
+    if(EMSCRIPTEN)
+        if(NOT DEFINED PLUME_DXC_EXECUTABLE)
+            message(FATAL_ERROR "Set PLUME_DXC_EXECUTABLE to a dxc that runs on this host.")
+        endif()
+
+        find_program(PLUME_NAGA_EXECUTABLE naga)
+        if(NOT PLUME_NAGA_EXECUTABLE)
+            message(FATAL_ERROR "naga not found: install naga-cli (cargo install naga-cli) or set PLUME_NAGA_EXECUTABLE.")
+        endif()
+
+        file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/shaders")
+        return()
+    endif()
+
     if(NOT DEFINED PLUME_DXC_EXECUTABLE)
         plume_fetch_dxc()
     endif()
@@ -52,6 +70,10 @@ function(_plume_compile_hlsl_impl TARGET_NAME SHADER_SOURCE SHADER_TYPE OUTPUT_N
     if(OUTPUT_FORMAT STREQUAL "spirv")
         set(OUTPUT_EXT "spirv")
         set(BLOB_SUFFIX "SPIRV")
+        set(FORMAT_FLAGS ${PLUME_DXC_SPV_OPTS})
+    elseif(OUTPUT_FORMAT STREQUAL "wgsl")
+        set(OUTPUT_EXT "wgsl.spirv")
+        set(BLOB_SUFFIX "WGSL")
         set(FORMAT_FLAGS ${PLUME_DXC_SPV_OPTS})
     elseif(OUTPUT_FORMAT STREQUAL "dxil")
         set(OUTPUT_EXT "dxil")
@@ -77,7 +99,9 @@ function(_plume_compile_hlsl_impl TARGET_NAME SHADER_SOURCE SHADER_TYPE OUTPUT_N
     set(DXC_TYPE_ARGS "")
     if(SHADER_TYPE STREQUAL "vertex")
         set(PROFILE "vs_${SHADER_MODEL}")
-        set(DXC_TYPE_ARGS "-fvk-invert-y")
+        if(NOT OUTPUT_FORMAT STREQUAL "wgsl")
+            set(DXC_TYPE_ARGS "-fvk-invert-y")
+        endif()
     elseif(SHADER_TYPE STREQUAL "pixel" OR SHADER_TYPE STREQUAL "fragment")
         set(PROFILE "ps_${SHADER_MODEL}")
     elseif(SHADER_TYPE STREQUAL "compute")
@@ -118,6 +142,25 @@ function(_plume_compile_hlsl_impl TARGET_NAME SHADER_SOURCE SHADER_TYPE OUTPUT_N
         COMMENT "DXC: ${SHADER_SOURCE} -> ${OUTPUT_EXT}"
         VERBATIM
     )
+
+    if(OUTPUT_FORMAT STREQUAL "wgsl")
+        set(WGSL_OUTPUT "${OUT_DIR}/${OUTPUT_NAME}.hlsl.wgsl")
+        set(C_OUTPUT "${OUT_DIR}/${OUTPUT_NAME}.hlsl.wgsl.c")
+        set(H_OUTPUT "${OUT_DIR}/${OUTPUT_NAME}.hlsl.wgsl.h")
+        add_custom_command(
+            OUTPUT "${WGSL_OUTPUT}" "${C_OUTPUT}" "${H_OUTPUT}"
+            COMMAND "${CMAKE_COMMAND}" "-DNAGA=${PLUME_NAGA_EXECUTABLE}" "-DINPUT=${OUTPUT_FILE}" "-DOUTPUT=${WGSL_OUTPUT}"
+                "-DVAR_NAME=${OUTPUT_NAME}Blob${BLOB_SUFFIX}" "-DOUTPUT_C=${C_OUTPUT}" "-DOUTPUT_H=${H_OUTPUT}"
+                -P "${PLUME_SHADERS_MODULE_DIR}/modules/PlumeWGSL.cmake"
+            DEPENDS "${OUTPUT_FILE}" "${PLUME_SHADERS_MODULE_DIR}/modules/PlumeWGSL.cmake"
+            COMMENT "naga: ${OUTPUT_FILE} -> WGSL"
+            VERBATIM
+        )
+
+        target_sources(${TARGET_NAME} PRIVATE "${C_OUTPUT}")
+        target_include_directories(${TARGET_NAME} PRIVATE "${CMAKE_BINARY_DIR}")
+        return()
+    endif()
 
     set(C_OUTPUT "${OUT_DIR}/${OUTPUT_NAME}.hlsl.${OUTPUT_EXT}.c")
     set(H_OUTPUT "${OUT_DIR}/${OUTPUT_NAME}.hlsl.${OUTPUT_EXT}.h")
@@ -241,6 +284,11 @@ function(plume_compile_shader TARGET_NAME SHADER_SOURCE SHADER_TYPE OUTPUT_NAME 
             set(OUT_DIR "${ARG_OUTPUT_DIR}")
         else()
             set(OUT_DIR "${CMAKE_BINARY_DIR}/shaders")
+        endif()
+
+        if(EMSCRIPTEN)
+            _plume_compile_hlsl_impl(${TARGET_NAME} "${SHADER_SOURCE}" ${SHADER_TYPE} ${OUTPUT_NAME} "wgsl" ${ENTRY_POINT} ${IMPL_ARGS})
+            return()
         endif()
 
         _plume_compile_hlsl_impl(${TARGET_NAME} "${SHADER_SOURCE}" ${SHADER_TYPE} ${OUTPUT_NAME} "spirv" ${ENTRY_POINT} ${IMPL_ARGS})
