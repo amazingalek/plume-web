@@ -9,24 +9,44 @@
 //
 // What core WebGPU lacks, and what this backend does instead:
 // - Push constants: a shader has one push constant block, as in Vulkan, with each range at its offset in it. Here
-//   the block is a uniform buffer at @group(3) @binding(0) (PushConstantsGroup: the last of the 4 bind groups WebGPU
-//   guarantees, so a layout can have up to 3 descriptor sets), written into a per command list ring and bound with
-//   a dynamic offset. Groups between the layout's sets and it are bound empty. WGSL made from SPIR-V by naga
+//   the block is a uniform buffer at @group(3) @binding(999) (PushConstantsGroup, PushConstantsBinding: the last of
+//   the 4 bind groups WebGPU guarantees), written into a per command list ring and bound with a dynamic offset. A
+//   layout with 4 descriptor sets shares group 3 between its 4th set and the block, so the set can't use binding
+//   999; with fewer, groups between the layout's sets and the block are bound empty. WGSL made from SPIR-V by naga
 //   declares the block as var<immediate> (var<push_constant> before naga 30); PlumeWGSL.cmake rewrites that line.
 // - Bind group layouts need each texture's sample type and each sampler's filtering, which plume's descriptor
 //   ranges don't carry. So a descriptor set derives its layout from what is bound in it, and a pipeline is created
 //   at draw time for the layouts of the sets bound then, and cached per pipeline layout.
 // - Buffer mapping is asynchronous. An UPLOAD buffer keeps a CPU copy: map() returns it and unmap() writes it to the
 //   GPU, and a buffer left mapped is written in full on every executeCommandLists(), since a persistently mapped
-//   D3D12-style upload buffer never says what changed. READBACK buffers can't be read synchronously and return
-//   their CPU copy as it is.
+//   D3D12-style upload buffer never says what changed. A READBACK buffer that a submitted command list copied into
+//   is mapped asynchronously right after the submission, and the callback copies it into the CPU copy, which map()
+//   returns, and isMapReady() is false until it has run. Behind plume_device_thread.h (a build with threads), the
+//   calling thread polls isMapReady() while the device thread is back in its event loop, where the callback runs.
+//   Without threads, map() waits for it itself when the build can (ASYNCIFY or JSPI: emscripten_sleep() hands the
+//   thread back to its event loop). Either way execute, wait, map reads what the GPU wrote, as on the other backends.
+//   A build that can't wait gets whatever arrived before the call, possibly a submission old.
+// - Formatted buffer views (texel buffers) don't exist. A formatted view binds its buffer as a read-only storage
+//   buffer of raw bytes, the binding padded to a multiple of 4, so the shader reads array<u32> and unpacks R8 or R16
+//   elements itself: element i of an n-byte format is at byte i * n, little-endian. A writable formatted view of
+//   elements under 4 bytes shares each u32 between neighbours, so a shader writing it needs atomicOr/atomicAnd.
 // - A command list is recorded straight into a WGPUCommandEncoder. Render passes open on the first draw or clear
 //   after setFramebuffer() and close on anything that can't happen inside one (copies, dispatches, barriers). A clear
-//   is the load op of the next pass, and a pass with only clears in it is opened when it closes.
-//   Clears with rectangles, resolving a region, timestamp queries, geometry shaders, binding arrays, triangle fans,
-//   logic ops and dynamic depth bias are not supported.
-// - Fences and semaphores are no-ops: WebGPU orders submissions and writeBuffer() calls on its one queue, and the
-//   browser presents the canvas when the calling thread returns to its event loop.
+//   of a whole target is the load op of the next pass, and a pass with only clears in it is opened when it closes. A
+//   clear of rectangles draws a triangle over the target clipped to each rectangle, with a pipeline of the backend's
+//   own: the color is the blend constant, the depth both ends of the viewport, the stencil value the reference.
+//   Integer color targets can't blend, nor 32-bit float ones without float32-blendable, so rectangle clears of
+//   those are ignored.
+// - Resolving part of a texture, MSAA sample locations, timestamp queries, geometry shaders, binding arrays,
+//   triangle fans, logic ops and dynamic depth bias are not supported, and the capabilities say so where plume has
+//   one (resolveRegion, sampleLocations, queryPools, triangleFan, dynamicDepthBias).
+// - Fences and semaphores are no-ops: WebGPU orders submissions and writeBuffer() calls on its one queue, and a
+//   READBACK buffer waits for its own data in map().
+// - The browser shows the canvas once the thread that drew it returns to its event loop. When the build can wait,
+//   present() does that until the next animation frame, which paces presents to the display, keeps at most one frame
+//   in flight, and times the display for getRefreshRate(). Otherwise present() returns at once and the caller has to
+//   give the thread back to the browser itself (emscripten_set_main_loop or similar), and the rate reads 60. Behind
+//   plume_device_thread.h the device thread does that between any two of its tasks, and presents aren't paced.
 // - Every call must come from the thread that owns the device's JavaScript object: WebGPU objects can't be shared
 //   between workers.
 // - Shaders are WGSL text (RenderShaderFormat::WGSL). Specialization constants are WGSL overrides named by their id.
@@ -50,6 +70,7 @@
 
 namespace plume {
     static const uint32_t PushConstantsGroup = 3;
+    static const uint32_t PushConstantsBinding = 999;
 
     struct WebGPUBuffer;
     struct WebGPUCommandQueue;
@@ -68,11 +89,20 @@ namespace plume {
         ~WebGPUBufferFormattedView() override;
     };
 
+    // A READBACK buffer's asynchronous map, shared with the callback that finishes it, so a buffer destroyed while a
+    // map is in flight is never touched.
+    struct WebGPUReadback {
+        WebGPUBuffer *buffer = nullptr;
+        uint64_t serial = 0;
+        bool pending = false;
+    };
+
     struct WebGPUBuffer : RenderBuffer {
         WGPUBuffer buffer = nullptr;
         WebGPUDevice *device = nullptr;
         RenderBufferDesc desc;
         std::vector<uint8_t> shadow;
+        std::shared_ptr<WebGPUReadback> readback;
         bool mapped = false;
 
         WebGPUBuffer(WebGPUDevice *device, WebGPUPool *pool, const RenderBufferDesc &desc);
@@ -82,7 +112,11 @@ namespace plume {
         std::unique_ptr<RenderBufferFormattedView> createBufferFormattedView(RenderFormat format) override;
         void setName(const std::string &name) override;
         uint64_t getDeviceAddress() const override;
+        bool isMapReady() override;
         void flush(uint64_t begin, uint64_t end);
+        void requestReadback();
+        void waitForReadback();
+        void cancelReadback();
     };
 
     struct WebGPUTexture : RenderTexture {
@@ -143,6 +177,11 @@ namespace plume {
         std::vector<Binding> bindings;
         WGPUBindGroupLayout layout = nullptr;
         WGPUBindGroup bindGroup = nullptr;
+        std::vector<WGPUBindGroupLayoutEntry> layoutEntries;
+        std::vector<WGPUBindGroupEntry> groupEntries;
+        std::string layoutKey;
+        WGPUBindGroupLayout layoutWithPushConstants = nullptr;
+        std::map<std::pair<uint64_t, uint32_t>, WGPUBindGroup> groupsWithPushConstants;
         bool dirty = true;
 
         WebGPUDescriptorSet(WebGPUDevice *device, const RenderDescriptorSetDesc &desc);
@@ -152,6 +191,9 @@ namespace plume {
         void setSampler(uint32_t descriptorIndex, const RenderSampler *sampler) override;
         void setAccelerationStructure(uint32_t descriptorIndex, const RenderAccelerationStructure *accelerationStructure) override;
         void update();
+        WGPUBindGroupLayout getLayoutWithPushConstants();
+        WGPUBindGroup getBindGroupWithPushConstants(WGPUBuffer buffer, uint64_t chunkId, uint32_t bindingSize);
+        void releaseGroupsWithPushConstants();
     };
 
     // A pipeline is created when it is first drawn with, after the RenderShader may be gone, so it keeps its own
@@ -234,6 +276,9 @@ namespace plume {
         uint32_t width = 0;
         uint32_t height = 0;
         bool vsyncEnabled = true;
+        double lastFrameTime = 0.0;
+        std::vector<double> frameIntervals;
+        uint32_t frameIntervalCursor = 0;
 
         WebGPUSwapChain(WebGPUCommandQueue *commandQueue, const RenderSwapChainDesc &desc);
         ~WebGPUSwapChain() override;
@@ -276,6 +321,7 @@ namespace plume {
 
         struct PushConstantsChunk {
             WGPUBuffer buffer = nullptr;
+            uint64_t id = 0;
             std::map<uint32_t, WGPUBindGroup> bindGroups;
             std::vector<uint8_t> data;
             uint32_t used = 0;
@@ -352,8 +398,12 @@ namespace plume {
         void resetQueryPool(const RenderQueryPool *queryPool, uint32_t queryFirstIndex, uint32_t queryCount) override;
         void writeTimestamp(const RenderQueryPool *queryPool, uint32_t queryIndex) override;
 
+        std::vector<WebGPUBuffer *> readbackDestinations;
+
         void endRenderPass();
         bool beginRenderPass();
+        void clearRects(int32_t colorAttachment, const RenderColor &color, bool clearDepth, bool clearStencil, float depthValue, uint32_t stencilValue, const RenderRect *rects, uint32_t rectCount);
+        void copiedInto(const RenderBuffer *buffer);
         bool prepareDraw();
         void setPushConstants(BindState &state, uint32_t rangeIndex, const void *data, uint32_t offset, uint32_t size);
         WGPUPipelineLayout resolveBindings(BindState &state);
@@ -398,13 +448,18 @@ namespace plume {
         RenderDeviceCapabilities capabilities;
         RenderDeviceDescription description;
         bool float32Filterable = false;
+        bool float32Blendable = false;
+        uint64_t pushConstantsChunkCount = 0;
         bool depthClipControl = false;
         WGPUBindGroupLayout emptyLayout = nullptr;
         WGPUBindGroup emptyBindGroup = nullptr;
+        WGPUBindGroupLayoutEntry pushConstantsEntry = {};
         WGPUBindGroupLayout pushConstantsLayout = nullptr;
         std::unordered_map<std::string, WGPUBindGroupLayout> bindGroupLayouts;
         std::map<std::vector<WGPUBindGroupLayout>, WGPUPipelineLayout> pipelineLayouts;
         std::vector<WebGPUBuffer *> mappedBuffers;
+        WGPUShaderModule clearShader = nullptr;
+        std::unordered_map<std::string, WGPURenderPipeline> clearPipelines;
 
         WebGPUDevice(WebGPUInterface *renderInterface);
         ~WebGPUDevice() override;
@@ -435,6 +490,7 @@ namespace plume {
         WGPUBindGroupLayout getBindGroupLayout(const std::string &key, const std::vector<WGPUBindGroupLayoutEntry> &entries);
         WGPUPipelineLayout getPipelineLayout(const std::vector<WGPUBindGroupLayout> &layouts);
         void flushMappedBuffers();
+        WGPURenderPipeline getClearPipeline(const WebGPUFramebuffer *framebuffer, int32_t colorAttachment, bool clearDepth, bool clearStencil);
     };
 
     struct WebGPUInterface : RenderInterface {

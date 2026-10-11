@@ -26,6 +26,10 @@ namespace plume {
         virtual void setName(const std::string &name) = 0;
         virtual uint64_t getDeviceAddress() const = 0;
 
+        // False while map() would return data the GPU has yet to deliver, on a backend that delivers it asynchronously
+        // (WebGPU's READBACK buffers). A thread other than the device's can wait for it to turn true.
+        virtual bool isMapReady() { return true; }
+
         // Concrete implementation shortcuts.
         inline RenderBufferReference at(uint64_t offset) const {
             return RenderBufferReference(this, offset);

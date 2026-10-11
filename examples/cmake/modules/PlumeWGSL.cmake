@@ -7,7 +7,9 @@
 # naga reads the SPIR-V that dxc writes for Vulkan. --keep-coordinate-space stops it negating the vertex position's y,
 # because the shader is compiled without -fvk-invert-y: WebGPU's clip space is D3D's. naga declares the push
 # constant block as var<immediate> (var<push_constant> before naga 30), which core WebGPU doesn't have, so the line
-# becomes the uniform buffer plume_webgpu.h puts push constants in, @group(3) @binding(0).
+# becomes the uniform buffer plume_webgpu.h puts push constants in, @group(3) @binding(999). dxc never marks an HLSL
+# RWTexture2D as write-only, so naga declares every storage texture read_write, which core WebGPU allows only in
+# r32float, r32uint and r32sint: any other format becomes write, as plume_webgpu.cpp binds it.
 
 foreach(ARG NAGA INPUT OUTPUT VAR_NAME OUTPUT_C OUTPUT_H)
     if(NOT DEFINED ${ARG})
@@ -26,7 +28,10 @@ if(NOT NAGA_RESULT EQUAL 0)
 endif()
 
 file(READ "${OUTPUT}" WGSL)
-string(REGEX REPLACE "var<(immediate|push_constant)>" "@group(3) @binding(0) var<uniform>" WGSL "${WGSL}")
+string(REGEX REPLACE "var<(immediate|push_constant)>" "@group(3) @binding(999) var<uniform>" WGSL "${WGSL}")
+string(REGEX REPLACE "(texture_storage_[123]d(_array)?<r32(float|uint|sint)),read_write>" "\\1,PLUME_READ_WRITE>" WGSL "${WGSL}")
+string(REPLACE ",read_write>" ",write>" WGSL "${WGSL}")
+string(REPLACE ",PLUME_READ_WRITE>" ",read_write>" WGSL "${WGSL}")
 file(WRITE "${OUTPUT}" "${WGSL}")
 
 # The same layout as plume_file_to_c's, with the text zero-terminated.

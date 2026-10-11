@@ -10,7 +10,9 @@
 #include "plume_device_thread.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <thread>
 #include <type_traits>
 
 #if defined(__EMSCRIPTEN_PTHREADS__)
@@ -59,8 +61,32 @@ namespace plume {
         DTBuffer(DeviceThread *thread, std::unique_ptr<RenderBuffer> inner) : thread(thread), inner(inner.release()) { }
         ~DTBuffer() override { destroyAsync(thread, inner); }
 
+        // Data the backend delivers asynchronously (WebGPU's READBACK buffers) arrives while the device thread is back
+        // in its event loop, so this thread polls isMapReady() between calls rather than holding the device thread. On
+        // the device thread itself, the backend's map() is all there is.
         void *map(uint32_t subresource, const RenderRange *readRange) override {
-            return runSync(thread, [&]() { return inner->map(subresource, readRange); });
+            const std::thread::id caller = std::this_thread::get_id();
+            for (;;) {
+                void *data = nullptr;
+                const bool ready = runSync(thread, [&]() {
+                    if ((std::this_thread::get_id() != caller) && !inner->isMapReady()) {
+                        return false;
+                    }
+
+                    data = inner->map(subresource, readRange);
+                    return true;
+                });
+
+                if (ready) {
+                    return data;
+                }
+
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
+        }
+
+        bool isMapReady() override {
+            return runSync(thread, [&]() { return inner->isMapReady(); });
         }
 
         void unmap(uint32_t subresource, const RenderRange *writtenRange) override {

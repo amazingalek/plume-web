@@ -34,3 +34,6 @@ plume_shaders_init()
 # Add example subdirectories
 add_subdirectory(triangle)
 add_subdirectory(cube)
+if(EMSCRIPTEN)
+    add_subdirectory(webgpu_checks)
+endif()

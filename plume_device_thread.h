@@ -11,7 +11,8 @@
 // thread in the order they were made.
 //
 // - A call that returns something (create*(), map(), a swap chain's resize() and needsResize(), ...) runs on the
-//   device thread while the caller waits.
+//   device thread while the caller waits. map() of a buffer whose data the backend delivers asynchronously waits on
+//   the calling side until isMapReady(), so the device thread keeps returning to its event loop meanwhile.
 // - A call that returns nothing (unmap(), setName(), descriptor writes, executeCommandLists(), present(), destroying
 //   an object) is queued and the caller goes on. The queue is first in, first out, so whatever happened before a call
 //   on the calling side, under the caller's own locks or on another thread it waited for, reaches the backend first.
