@@ -49,7 +49,18 @@
 //   plume_device_thread.h the device thread does that between any two of its tasks, and presents aren't paced.
 // - Every call must come from the thread that owns the device's JavaScript object: WebGPU objects can't be shared
 //   between workers.
-// - Shaders are WGSL text (RenderShaderFormat::WGSL). Specialization constants are WGSL overrides named by their id.
+// - Shaders are WGSL text (RenderShaderFormat::WGSL). Specialization constants are WGSL overrides named by their id,
+//   and a pipeline gets only those its shader declares: WebGPU refuses the rest, and a shader compiler drops what the
+//   shader doesn't use.
+// - A binding counts against the per-stage limits (16 storage buffers, 16 samplers...) in every stage its layout
+//   entry is visible to, whether or not a shader there reads it. So an entry is visible only to the stages whose
+//   shaders, of all created so far, declare that binding number (in any group), and a set's layout is rebuilt when a
+//   new shader adds a stage to one of its bindings. A shader has to be created before the first draw that reads a
+//   binding from a stage no other shader reads it from.
+// - Depth textures are bound as unfilterable-float, which is how a shader written for the other backends reads them
+//   (a texture of floats, not a depth texture).
+// - Buffer copies are in whole 4-byte words: a copy whose offsets or size aren't is widened to the words around it,
+//   so up to 3 bytes either side are copied too. That is exact for a staging buffer that mirrors its destination.
 //
 // The device is created by the page before the module starts (Module.preinitializedWebGPUDevice, see
 // plume_webgpu_device.js), because requesting one is asynchronous. Emdawnwebgpu marks emscripten_webgpu_get_device(),
@@ -64,6 +75,7 @@
 #include "plume_render_interface.h"
 
 #include <map>
+#include <set>
 #include <unordered_map>
 
 #include <webgpu/webgpu.h>
@@ -155,6 +167,7 @@ namespace plume {
     struct WebGPUShader : RenderShader {
         WGPUShaderModule module = nullptr;
         std::string entryPointName;
+        std::set<uint32_t> overrideIds;
 
         WebGPUShader(WebGPUDevice *device, const void *data, uint64_t size, const char *entryPointName, RenderShaderFormat format);
         ~WebGPUShader() override;
@@ -182,6 +195,7 @@ namespace plume {
         std::string layoutKey;
         WGPUBindGroupLayout layoutWithPushConstants = nullptr;
         std::map<std::pair<uint64_t, uint32_t>, WGPUBindGroup> groupsWithPushConstants;
+        uint64_t bindingStagesRevision = 0;
         bool dirty = true;
 
         WebGPUDescriptorSet(WebGPUDevice *device, const RenderDescriptorSetDesc &desc);
@@ -201,6 +215,7 @@ namespace plume {
     struct WebGPUShaderStage {
         WGPUShaderModule module = nullptr;
         std::string entryPointName;
+        std::set<uint32_t> overrideIds;
 
         WebGPUShaderStage() = default;
         WebGPUShaderStage(const RenderShader *shader);
@@ -456,6 +471,8 @@ namespace plume {
         WGPUBindGroupLayoutEntry pushConstantsEntry = {};
         WGPUBindGroupLayout pushConstantsLayout = nullptr;
         std::unordered_map<std::string, WGPUBindGroupLayout> bindGroupLayouts;
+        std::unordered_map<uint32_t, WGPUShaderStage> bindingStages;
+        uint64_t bindingStagesRevision = 0;
         std::map<std::vector<WGPUBindGroupLayout>, WGPUPipelineLayout> pipelineLayouts;
         std::vector<WebGPUBuffer *> mappedBuffers;
         WGPUShaderModule clearShader = nullptr;

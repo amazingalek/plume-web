@@ -1790,6 +1790,9 @@ namespace plume {
         // Samplers.
         bool samplerMirrorClampToEdge = false;
 
+        // Blending with a pixel shader's second output (SRC1). Every backend has it but WebGPU, where it's an optional feature.
+        bool dualSourceBlending = true;
+
         // Present.
         bool presentWait = false;
         bool displayTiming = false;
