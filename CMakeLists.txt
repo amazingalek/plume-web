@@ -84,6 +84,12 @@ elseif(WIN32)
     )
 endif()
 
+# Runs any backend on one thread: see plume_device_thread.h.
+list(APPEND PLUME_SOURCES
+    plume_device_thread.cpp
+    plume_device_thread.h
+)
+
 # Create target
 add_library(plume STATIC ${PLUME_SOURCES})
 

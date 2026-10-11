@@ -23,6 +23,9 @@
 #endif
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
+#ifdef __EMSCRIPTEN_PTHREADS__
+#include "plume_device_thread.h"
+#endif
 #include "shaders/cubeVert.hlsl.wgsl.h"
 #include "shaders/cubeFrag.hlsl.wgsl.h"
 #else
@@ -565,7 +568,10 @@ namespace plume {
             }
 
             render(ctx);
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN_PTHREADS__)
+            // This is a thread of its own, and the page's main thread shows the frames (see main()).
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+#elif defined(__EMSCRIPTEN__)
             // The browser shows the frame once control is back in its event loop.
             emscripten_sleep(0);
 #endif
@@ -618,6 +624,11 @@ std::unique_ptr<plume::RenderInterface> CreateRenderInterface(SDL_Window* window
         apiName = "Metal";
         return plume::CreateMetalInterface();
     }
+#elif defined(__EMSCRIPTEN_PTHREADS__)
+    // Built with -pthread: the device belongs to the page's main thread, which this runs on, and the example draws
+    // from a thread of its own through plume_device_thread.h.
+    apiName = "WebGPU, drawn from a thread";
+    return plume::CreateDeviceThreadInterface(plume::CreateEmscriptenDeviceThread(pthread_self()), []() { return plume::CreateWebGPUInterface(); });
 #elif defined(__EMSCRIPTEN__)
     apiName = "WebGPU";
     return plume::CreateWebGPUInterface();
@@ -659,6 +670,16 @@ int main(int argc, char* argv[]) {
         SDL_Quit();
         return 1;
     }
+
+#ifdef __EMSCRIPTEN_PTHREADS__
+    // Draw from another thread and return, so that this one, the page's main thread, goes back to its event loop and
+    // runs the device's work as it arrives.
+    std::thread([window, apiName, renderInterface = std::move(renderInterface)]() {
+        plume::CubeExample(renderInterface.get(), window, apiName);
+    }).detach();
+
+    return 0;
+#endif
 
     plume::CubeExample(renderInterface.get(), window, apiName);
 

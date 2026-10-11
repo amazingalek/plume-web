@@ -8,8 +8,14 @@ endif()
 if(EMSCRIPTEN)
     # SDL2 from Emscripten's port, the page from its default shell (a canvas with id "canvas"), the WebGPU device
     # from plume_webgpu_device.js, and ASYNCIFY so the examples' loops can yield to the browser every frame.
+    # Configured with -DCMAKE_CXX_FLAGS=-pthread -DCMAKE_C_FLAGS=-pthread instead, an example draws from a thread of
+    # its own and the page's main thread runs the device for it (plume_device_thread.h); that needs no ASYNCIFY, and
+    # the page needs cross-origin isolation (Cross-Origin-Opener-Policy and Cross-Origin-Embedder-Policy headers).
     add_compile_options(-sUSE_SDL=2)
-    add_link_options(-sUSE_SDL=2 -sASYNCIFY -sALLOW_MEMORY_GROWTH
+    if(NOT CMAKE_CXX_FLAGS MATCHES "-pthread")
+        add_link_options(-sASYNCIFY)
+    endif()
+    add_link_options(-sUSE_SDL=2 -sALLOW_MEMORY_GROWTH
         "-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=$addRunDependency,$removeRunDependency"
         "--pre-js=${CMAKE_SOURCE_DIR}/plume_webgpu_device.js")
     set(CMAKE_EXECUTABLE_SUFFIX ".html")

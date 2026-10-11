@@ -1,0 +1,62 @@
+//
+// plume
+//
+// Copyright (c) 2024 renderbag and contributors. All rights reserved.
+// Licensed under the MIT license. See LICENSE file for details.
+//
+
+// A RenderInterface that runs another one on a single thread, for a backend whose every call has to come from the
+// thread that owns the device: WebGPU in a browser, where the device is a JavaScript object that can't leave the
+// worker (or the page) that made it. Any number of threads may call it, and the calls reach the backend on the device
+// thread in the order they were made.
+//
+// - A call that returns something (create*(), map(), a swap chain's resize() and needsResize(), ...) runs on the
+//   device thread while the caller waits.
+// - A call that returns nothing (unmap(), setName(), descriptor writes, executeCommandLists(), present(), destroying
+//   an object) is queued and the caller goes on. The queue is first in, first out, so whatever happened before a call
+//   on the calling side, under the caller's own locks or on another thread it waited for, reaches the backend first.
+// - A command list records on the calling thread, copying whatever its arguments point at, and is replayed into a
+//   backend command list on the device thread when it's executed. Recording never waits for the device thread.
+// - waitForCommandFence() waits for the device thread to run everything queued before it, then for the fence. On a
+//   backend whose fences are no-ops (WebGPU's), that is what makes it safe to reuse what the GPU work used.
+// - A swap chain hands out textures of its own, and present() copies the one drawn into the backend's swap chain
+//   texture: acquire, copy and present run as one task on the device thread. A browser shows the canvas between two
+//   tasks of its event loop whenever it updates the rendering, so a canvas texture acquired in one task can be gone
+//   by the next. That costs a copy of the window each present.
+// - On the device thread itself, everything runs in place, after whatever is queued.
+// - Raytracing and acceleration structures aren't forwarded: WebGPU has neither.
+//
+// A DeviceThread is how calls get there. CreateEmscriptenDeviceThread() proxies them with Emscripten's proxying queue
+// to a thread that returns to its event loop, such as the page's main thread with the program itself in pthreads
+// (-sPROXY_TO_PTHREAD, or threads it starts). Anything that runs the queued work in order on one thread will do.
+
+#pragma once
+
+#include "plume_render_interface.h"
+
+#include <functional>
+
+#if defined(__EMSCRIPTEN_PTHREADS__)
+#include <pthread.h>
+#endif
+
+namespace plume {
+    struct DeviceThread {
+        virtual ~DeviceThread() { }
+
+        // Runs work on the device thread after everything queued before it, and returns once it has run.
+        virtual void runSync(const std::function<void()> &work) = 0;
+
+        // Queues work to run on the device thread after everything queued before it, and returns.
+        virtual void runAsync(std::function<void()> &&work) = 0;
+    };
+
+    // Creates the backend on the device thread with createInterface, and returns an interface that runs it there.
+    extern std::unique_ptr<RenderInterface> CreateDeviceThreadInterface(std::shared_ptr<DeviceThread> deviceThread, const std::function<std::unique_ptr<RenderInterface>()> &createInterface);
+
+#if defined(__EMSCRIPTEN_PTHREADS__)
+    // The work runs on thread when it returns to its event loop. Use emscripten_main_runtime_thread_id() for the page's
+    // main thread, which is where a canvas and a device requested by the page are.
+    extern std::shared_ptr<DeviceThread> CreateEmscriptenDeviceThread(pthread_t thread);
+#endif
+};
