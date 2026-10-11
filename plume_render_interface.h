@@ -63,6 +63,10 @@ namespace plume {
         virtual ~RenderPipeline() { }
         virtual void setName(const std::string &name) = 0;
         virtual RenderPipelineProgram getProgram(const std::string &name) const = 0;
+
+        // False until the backend has built a pipeline created with buildInBackground (WebGPU's
+        // createRenderPipelineAsync). A thread other than the device's can wait for it to turn true.
+        virtual bool isReady() { return true; }
     };
 
     struct RenderPipelineLayout {

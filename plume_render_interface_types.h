@@ -1309,6 +1309,10 @@ namespace plume {
         uint32_t inputElementsCount = 0;
         const RenderSpecConstant *specConstants = nullptr;
         uint32_t specConstantsCount = 0;
+
+        // The caller draws with something else until the pipeline's isReady(), so a backend that can build it in the
+        // background (WebGPU) does, rather than when it's first drawn with.
+        bool buildInBackground = false;
     };
 
     struct RenderRaytracingPipelineLibrarySymbol {

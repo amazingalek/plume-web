@@ -1111,12 +1111,58 @@ namespace plume {
         this->desc.vertexShader = nullptr;
         this->desc.geometryShader = nullptr;
         this->desc.pixelShader = nullptr;
+
+        // Start building it in the background for the layouts draws with its pipeline layout have resolved to, or
+        // once the first one has.
+        builds = std::make_shared<WebGPURenderPipelineBuilds>();
+        builds->pipeline = this;
+        if (desc.buildInBackground && (desc.pipelineLayout != nullptr)) {
+            const WebGPUPipelineLayout *pipelineLayout = static_cast<const WebGPUPipelineLayout *>(desc.pipelineLayout);
+            if (pipelineLayout->resolvedLayouts.empty()) {
+                builds->waitingForLayout = true;
+                pipelineLayout->waitingBuilds.emplace_back(builds);
+            }
+
+            for (WGPUPipelineLayout layout : pipelineLayout->resolvedLayouts) {
+                build(layout, true);
+            }
+        }
     }
 
     WebGPUGraphicsPipeline::~WebGPUGraphicsPipeline() {
+        builds->pipeline = nullptr;
         for (auto &it : pipelines) {
             wgpuRenderPipelineRelease(it.second);
         }
+    }
+
+    static void renderPipelineBuilt(WGPUCreatePipelineAsyncStatus status, WGPURenderPipeline result, WGPUStringView message, void *userdata1, void *userdata2) {
+        std::shared_ptr<WebGPURenderPipelineBuilds> *pointer = static_cast<std::shared_ptr<WebGPURenderPipelineBuilds> *>(userdata1);
+        std::shared_ptr<WebGPURenderPipelineBuilds> builds = std::move(*pointer);
+        delete pointer;
+
+        WGPUPipelineLayout layout = static_cast<WGPUPipelineLayout>(userdata2);
+        builds->pending.erase(layout);
+        if ((status != WGPUCreatePipelineAsyncStatus_Success) && (status != WGPUCreatePipelineAsyncStatus_CallbackCancelled)) {
+            fprintf(stderr, "plume WebGPU: a pipeline built in the background failed: %.*s\n", int(message.length), message.data);
+        }
+
+        if (result == nullptr) {
+            return;
+        }
+
+        // Gone, or built in place by a draw that couldn't wait.
+        WebGPUGraphicsPipeline *pipeline = builds->pipeline;
+        if ((pipeline == nullptr) || (pipeline->pipelines.find(layout) != pipeline->pipelines.end())) {
+            wgpuRenderPipelineRelease(result);
+            return;
+        }
+
+        pipeline->pipelines[layout] = result;
+    }
+
+    bool WebGPUGraphicsPipeline::isReady() {
+        return !builds->waitingForLayout && builds->pending.empty();
     }
 
     WGPURenderPipeline WebGPUGraphicsPipeline::get(WGPUPipelineLayout layout) {
@@ -1125,6 +1171,10 @@ namespace plume {
             return it->second;
         }
 
+        return build(layout, false);
+    }
+
+    WGPURenderPipeline WebGPUGraphicsPipeline::build(WGPUPipelineLayout layout, bool async) {
         std::vector<std::string> keys;
         std::vector<WGPUConstantEntry> constants = toConstantEntries(specConstants, vertexStage, keys);
         std::vector<std::string> pixelKeys;
@@ -1227,6 +1277,17 @@ namespace plume {
             fragment.targetCount = desc.renderTargetCount;
             fragment.targets = targets;
             pipelineDesc.fragment = &fragment;
+        }
+
+        if (async) {
+            WGPUCreateRenderPipelineAsyncCallbackInfo callbackInfo = WGPU_CREATE_RENDER_PIPELINE_ASYNC_CALLBACK_INFO_INIT;
+            callbackInfo.mode = WGPUCallbackMode_AllowSpontaneous;
+            callbackInfo.callback = renderPipelineBuilt;
+            callbackInfo.userdata1 = new std::shared_ptr<WebGPURenderPipelineBuilds>(builds);
+            callbackInfo.userdata2 = layout;
+            builds->pending.insert(layout);
+            wgpuDeviceCreateRenderPipelineAsync(device->device, &pipelineDesc, callbackInfo);
+            return nullptr;
         }
 
         WGPURenderPipeline pipeline = wgpuDeviceCreateRenderPipeline(device->device, &pipelineDesc);
@@ -1596,7 +1657,30 @@ namespace plume {
             layouts.emplace_back(device->pushConstantsLayout);
         }
 
-        return device->getPipelineLayout(layouts);
+        // Remember what the layout resolved to, for the pipelines created with it later (WebGPUGraphicsPipeline), and start
+        // the ones waiting for it. A new binding stage rebuilds every set's layout, so what it resolved to before is no
+        // longer drawn with.
+        WGPUPipelineLayout pipelineLayout = device->getPipelineLayout(layouts);
+        std::vector<WGPUPipelineLayout> &resolvedLayouts = state.layout->resolvedLayouts;
+        if (state.layout->resolvedRevision != device->bindingStagesRevision) {
+            state.layout->resolvedRevision = device->bindingStagesRevision;
+            resolvedLayouts.clear();
+        }
+
+        if (std::find(resolvedLayouts.begin(), resolvedLayouts.end(), pipelineLayout) == resolvedLayouts.end()) {
+            resolvedLayouts.emplace_back(pipelineLayout);
+            for (const std::weak_ptr<WebGPURenderPipelineBuilds> &waiting : state.layout->waitingBuilds) {
+                std::shared_ptr<WebGPURenderPipelineBuilds> builds = waiting.lock();
+                if ((builds != nullptr) && (builds->pipeline != nullptr)) {
+                    builds->waitingForLayout = false;
+                    builds->pipeline->build(pipelineLayout, true);
+                }
+            }
+
+            state.layout->waitingBuilds.clear();
+        }
+
+        return pipelineLayout;
     }
 
     void WebGPUCommandList::bindGroups(BindState &state, WGPURenderPassEncoder renderPass, WGPUComputePassEncoder computePass) {

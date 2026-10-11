@@ -17,6 +17,12 @@
 // - Bind group layouts need each texture's sample type and each sampler's filtering, which plume's descriptor
 //   ranges don't carry. So a descriptor set derives its layout from what is bound in it, and a pipeline is created
 //   at draw time for the layouts of the sets bound then, and cached per pipeline layout.
+// - Building a pipeline holds up the browser's GPU process (a large WGSL shader can take seconds), so a graphics
+//   pipeline created with buildInBackground is built with createRenderPipelineAsync for the WebGPU layouts draws
+//   with its plume layout have resolved to, and isReady() is false until every build has called back. Created before
+//   any draw resolved that layout, it waits for the first one to. Behind plume_device_thread.h, createGraphicsPipeline()
+//   waits for isReady() on the calling thread, which draws with another pipeline meanwhile. A draw with a layout the
+//   pipeline wasn't built for (a new binding stage changes them all) builds it in place, as any other pipeline is.
 // - Buffer mapping is asynchronous. An UPLOAD buffer keeps a CPU copy: map() returns it and unmap() writes it to the
 //   GPU, and a buffer left mapped is written in full on every executeCommandLists(), since a persistently mapped
 //   D3D12-style upload buffer never says what changed. A READBACK buffer that a submitted command list copied into
@@ -89,6 +95,7 @@ namespace plume {
     struct WebGPUDevice;
     struct WebGPUGraphicsPipeline;
     struct WebGPUInterface;
+    struct WebGPURenderPipelineBuilds;
     struct WebGPUPipelineLayout;
     struct WebGPUPool;
     struct WebGPUTexture;
@@ -251,6 +258,13 @@ namespace plume {
         WGPUComputePipeline get(WGPUPipelineLayout layout);
     };
 
+    // A graphics pipeline's builds in flight, shared with their callbacks, which can run after it is gone.
+    struct WebGPURenderPipelineBuilds {
+        WebGPUGraphicsPipeline *pipeline = nullptr;
+        std::set<WGPUPipelineLayout> pending;
+        bool waitingForLayout = false;
+    };
+
     struct WebGPUGraphicsPipeline : WebGPUPipeline {
         RenderGraphicsPipelineDesc desc;
         WebGPUShaderStage vertexStage;
@@ -259,10 +273,13 @@ namespace plume {
         std::vector<RenderInputElement> inputElements;
         std::vector<RenderSpecConstant> specConstants;
         std::map<WGPUPipelineLayout, WGPURenderPipeline> pipelines;
+        std::shared_ptr<WebGPURenderPipelineBuilds> builds;
 
         WebGPUGraphicsPipeline(WebGPUDevice *device, const RenderGraphicsPipelineDesc &desc);
         ~WebGPUGraphicsPipeline() override;
+        bool isReady() override;
         WGPURenderPipeline get(WGPUPipelineLayout layout);
+        WGPURenderPipeline build(WGPUPipelineLayout layout, bool async);
     };
 
     struct WebGPUPipelineLayout : RenderPipelineLayout {
@@ -270,6 +287,13 @@ namespace plume {
         uint32_t descriptorSetCount = 0;
         std::vector<RenderPushConstantRange> pushConstantRanges;
         uint32_t pushConstantsSize = 0;
+
+        // The WebGPU layouts draws with it have resolved to since the last new binding stage (bindingStagesRevision).
+        mutable std::vector<WGPUPipelineLayout> resolvedLayouts;
+        mutable uint64_t resolvedRevision = 0;
+
+        // Pipelines to build in the background that were created before any draw resolved it.
+        mutable std::vector<std::weak_ptr<WebGPURenderPipelineBuilds>> waitingBuilds;
 
         WebGPUPipelineLayout(WebGPUDevice *device, const RenderPipelineLayoutDesc &desc);
         ~WebGPUPipelineLayout() override;

@@ -176,6 +176,20 @@ namespace plume {
         RenderPipelineProgram getProgram(const std::string &name) const override {
             return runSync(thread, [&]() { return inner->getProgram(name); });
         }
+
+        bool isReady() override {
+            return runSync(thread, [&]() { return inner->isReady(); });
+        }
+
+        // A pipeline the backend builds asynchronously (WebGPU's) is finished while the device thread is back in its
+        // event loop, so this thread polls isReady() between calls rather than holding the device thread. The builds
+        // take hundreds of milliseconds, so it polls rarely. On the device thread itself there is nothing to wait for.
+        void waitUntilReady() {
+            const std::thread::id caller = std::this_thread::get_id();
+            while (!runSync(thread, [&]() { return (std::this_thread::get_id() == caller) || inner->isReady(); })) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        }
     };
 
     struct DTPipelineLayout : RenderPipelineLayout {
@@ -872,7 +886,12 @@ namespace plume {
             unwrapped.vertexShader = unwrap(desc.vertexShader);
             unwrapped.geometryShader = unwrap(desc.geometryShader);
             unwrapped.pixelShader = unwrap(desc.pixelShader);
-            return create<DTPipeline, RenderPipeline>([&]() { return inner->createGraphicsPipeline(unwrapped); });
+            std::unique_ptr<RenderPipeline> pipeline = create<DTPipeline, RenderPipeline>([&]() { return inner->createGraphicsPipeline(unwrapped); });
+            if (pipeline != nullptr) {
+                static_cast<DTPipeline *>(pipeline.get())->waitUntilReady();
+            }
+
+            return pipeline;
         }
 
         std::unique_ptr<RenderPipeline> createRaytracingPipeline(const RenderRaytracingPipelineDesc &desc, const RenderPipeline *previousPipeline) override {
