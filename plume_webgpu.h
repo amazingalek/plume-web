@@ -49,10 +49,12 @@
 // - Fences and semaphores are no-ops: WebGPU orders submissions and writeBuffer() calls on its one queue, and a
 //   READBACK buffer waits for its own data in map().
 // - The browser shows the canvas once the thread that drew it returns to its event loop. When the build can wait,
-//   present() does that until the next animation frame, which paces presents to the display, keeps at most one frame
-//   in flight, and times the display for getRefreshRate(). Otherwise present() returns at once and the caller has to
-//   give the thread back to the browser itself (emscripten_set_main_loop or similar), and the rate reads 60. Behind
-//   plume_device_thread.h the device thread does that between any two of its tasks, and presents aren't paced.
+//   present() does that until the next animation frame, which paces presents to the display and keeps at most one
+//   frame in flight. Otherwise present() returns at once and the caller has to give the thread back to the browser
+//   itself (emscripten_set_main_loop or similar). Behind plume_device_thread.h the device thread does that between any
+//   two of its tasks, and presents aren't paced.
+// - The browser doesn't say what the display's refresh rate is, so a swap chain times the animation frames with a
+//   loop of its own on the device's thread, whatever its caller presents at, and reports displayTiming.
 // - Every call must come from the thread that owns the device's JavaScript object: WebGPU objects can't be shared
 //   between workers.
 // - Shaders are WGSL text (RenderShaderFormat::WGSL). Specialization constants are WGSL overrides named by their id,
@@ -305,6 +307,15 @@ namespace plume {
     struct WebGPUCommandSemaphore : RenderCommandSemaphore {
     };
 
+    // The intervals between the browser's animation frames, for getRefreshRate(). Its loop frees it on the first frame
+    // after the swap chain has stopped it.
+    struct WebGPUFrameTimer {
+        bool stopped = false;
+        double lastFrameTime = 0.0;
+        std::vector<double> frameIntervals;
+        uint32_t frameIntervalCursor = 0;
+    };
+
     struct WebGPUSwapChain : RenderSwapChain {
         WebGPUCommandQueue *commandQueue = nullptr;
         WGPUSurface surface = nullptr;
@@ -315,9 +326,7 @@ namespace plume {
         uint32_t width = 0;
         uint32_t height = 0;
         bool vsyncEnabled = true;
-        double lastFrameTime = 0.0;
-        std::vector<double> frameIntervals;
-        uint32_t frameIntervalCursor = 0;
+        WebGPUFrameTimer *frameTimer = nullptr;
 
         WebGPUSwapChain(WebGPUCommandQueue *commandQueue, const RenderSwapChainDesc &desc);
         ~WebGPUSwapChain() override;

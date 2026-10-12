@@ -1319,6 +1319,31 @@ namespace plume {
 
     // WebGPUSwapChain
 
+    // Keeps the last 15 intervals between animation frames, of which getRefreshRate() takes the median. A gap of more
+    // than 100 ms is the page being hidden or its thread being busy, not the display.
+    static bool timeAnimationFrame(double time, void *userData) {
+        WebGPUFrameTimer *timer = static_cast<WebGPUFrameTimer *>(userData);
+        if (timer->stopped) {
+            delete timer;
+            return false;
+        }
+
+        const double interval = time - timer->lastFrameTime;
+        if ((timer->lastFrameTime > 0.0) && (interval > 0.0) && (interval < 100.0)) {
+            const uint32_t IntervalCount = 15;
+            if (timer->frameIntervals.size() < IntervalCount) {
+                timer->frameIntervals.emplace_back(interval);
+            }
+            else {
+                timer->frameIntervals[timer->frameIntervalCursor] = interval;
+                timer->frameIntervalCursor = (timer->frameIntervalCursor + 1) % IntervalCount;
+            }
+        }
+
+        timer->lastFrameTime = time;
+        return true;
+    }
+
     WebGPUSwapChain::WebGPUSwapChain(WebGPUCommandQueue *commandQueue, const RenderSwapChainDesc &desc) {
         assert(commandQueue != nullptr);
         assert(desc.renderWindow != nullptr);
@@ -1346,9 +1371,13 @@ namespace plume {
             texture->desc = RenderTextureDesc::ColorTarget(1, 1, desc.format);
             textures.emplace_back(std::move(texture));
         }
+
+        frameTimer = new WebGPUFrameTimer();
+        emscripten_request_animation_frame_loop(timeAnimationFrame, frameTimer);
     }
 
     WebGPUSwapChain::~WebGPUSwapChain() {
+        frameTimer->stopped = true;
         textures.clear();
         if (surface != nullptr) {
             wgpuSurfaceUnconfigure(surface);
@@ -1362,7 +1391,7 @@ namespace plume {
     }
 
     // The browser shows the canvas when this thread returns to its event loop, so when the build can wait, this does
-    // that until the next animation frame (or just once without vsync), and times the frames for getRefreshRate().
+    // that until the next animation frame (or just once without vsync).
     bool WebGPUSwapChain::present(uint32_t textureIndex, RenderCommandSemaphore **waitSemaphores, uint32_t waitSemaphoreCount) {
         if (!canWait()) {
             return true;
@@ -1379,21 +1408,6 @@ namespace plume {
             emscripten_sleep(0);
         }
 
-        // The last 15 frame intervals, of which getRefreshRate() takes the median. A gap of more than 100 ms is the
-        // page being hidden or the caller being late, not the display.
-        const double interval = frameTime - lastFrameTime;
-        if ((lastFrameTime > 0.0) && (interval > 0.0) && (interval < 100.0)) {
-            const uint32_t IntervalCount = 15;
-            if (frameIntervals.size() < IntervalCount) {
-                frameIntervals.emplace_back(interval);
-            }
-            else {
-                frameIntervals[frameIntervalCursor] = interval;
-                frameIntervalCursor = (frameIntervalCursor + 1) % IntervalCount;
-            }
-        }
-
-        lastFrameTime = frameTime;
         return true;
     }
 
@@ -1493,13 +1507,12 @@ namespace plume {
     }
 
     uint32_t WebGPUSwapChain::getRefreshRate() const {
-        // The browser doesn't say, so it is timed by present(). Until it has been, 60 is what requestAnimationFrame
-        // runs at on most displays.
-        if (frameIntervals.size() < 5) {
+        // Until the animation frames have been timed, 60 is what they run at on most displays.
+        if (frameTimer->frameIntervals.size() < 5) {
             return 60;
         }
 
-        std::vector<double> sorted = frameIntervals;
+        std::vector<double> sorted = frameTimer->frameIntervals;
         std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
         return uint32_t(std::lround(1000.0 / sorted[sorted.size() / 2]));
     }
@@ -2390,6 +2403,7 @@ namespace plume {
         capabilities.triangleFan = false;
         capabilities.dynamicDepthBias = false;
         capabilities.queryPools = false;
+        capabilities.displayTiming = true;
         description.name = "WebGPU";
     }
 
