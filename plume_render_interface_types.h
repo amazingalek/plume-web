@@ -1803,7 +1803,7 @@ namespace plume {
 
         // Pipelines.
         // A pipeline built with buildInBackground leaves the device's other work running while it builds. Not so on
-        // WebGPU in Firefox, whose GPU process builds it in line and presents nothing meanwhile.
+        // WebGPU in Firefox, whose GPU process builds it in line and presents nothing meanwhile, nor on an Intel adapter.
         bool backgroundPipelineBuilds = true;
 
         // Framebuffers.

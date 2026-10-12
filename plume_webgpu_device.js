@@ -2,7 +2,8 @@
 // main() runs and hands the device over as Module.preinitializedWebGPUDevice, which emscripten_webgpu_get_device()
 // returns. Optional features plume can use are asked for when the adapter has them, and the adapter's own maximum for
 // the limits a renderer with big descriptor sets and buffers runs into first (WebGPU's defaults are far below what
-// desktop GPUs offer). Validation errors and a lost device are logged to the console.
+// desktop GPUs offer). Validation errors and a lost device are logged to the console. The adapter's info (vendor,
+// architecture) is kept as Module.plumeWebGPUAdapterInfo.
 Module['preRun'] = [].concat(Module['preRun'] || []);
 Module['preRun'].push(() => {
   addRunDependency('plume-webgpu-device');
@@ -31,6 +32,7 @@ Module['preRun'].push(() => {
     device.addEventListener('uncapturederror', (event) => console.error('WebGPU error: ' + event.error.message));
     device.lost.then((info) => console.error('WebGPU device lost: ' + info.message));
     Module['preinitializedWebGPUDevice'] = device;
+    Module['plumeWebGPUAdapterInfo'] = adapter.info;
     removeRunDependency('plume-webgpu-device');
   })().catch((error) => {
     console.error(error);
