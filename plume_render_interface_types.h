@@ -1801,6 +1801,11 @@ namespace plume {
         bool presentWait = false;
         bool displayTiming = false;
 
+        // Pipelines.
+        // A pipeline built with buildInBackground leaves the device's other work running while it builds. Not so on
+        // WebGPU in Firefox, whose GPU process builds it in line and presents nothing meanwhile.
+        bool backgroundPipelineBuilds = true;
+
         // Framebuffers.
         uint64_t maxTextureSize = 0;
 

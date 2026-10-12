@@ -17,6 +17,13 @@
 #include <emscripten/emscripten.h>
 #include <emscripten/html5.h>
 
+// Whether the browser builds a pipeline made with createRenderPipelineAsync without holding up the device. Chrome builds
+// it on threads of its own. Firefox (157, Windows) builds it on its GPU process's WebGPU thread, in line with everything
+// else on the device: a specialized RasterPS of RT64's took 2-8 s there, with no frame presented meanwhile.
+EM_JS(int, plume_webgpu_background_pipeline_builds, (), {
+    return navigator.userAgent.includes('Firefox') ? 0 : 1;
+});
+
 namespace plume {
     static const uint32_t PushConstantsAlignment = 256;
 
@@ -2404,6 +2411,7 @@ namespace plume {
         capabilities.dynamicDepthBias = false;
         capabilities.queryPools = false;
         capabilities.displayTiming = true;
+        capabilities.backgroundPipelineBuilds = (plume_webgpu_background_pipeline_builds() != 0);
         description.name = "WebGPU";
     }
 
