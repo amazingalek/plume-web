@@ -19,18 +19,13 @@
 
 // Whether the browser builds a pipeline made with createRenderPipelineAsync without holding up the device. Chrome builds
 // it on threads of its own. Firefox (157, Windows) builds it on its GPU process's WebGPU thread, in line with everything
-// else on the device: a specialized RasterPS of RT64's took 2-8 s there, with no frame presented meanwhile. On an Intel
-// adapter Chrome's builds hold it up too: on a laptop's UHD Graphics (Tiger Lake, Chrome 155, D3D12) RT64's page ran
-// at about a frame a second for minutes in menus and 20-30 in a race while they built (in a canvas of about 960x500),
-// and close to 60 once they had, where the same laptop's NVIDIA adapter (same CPU, an empty cache) didn't stall. Intel's
-// driver compiler is the difference, so this takes every Intel adapter. The adapter's info is plume_webgpu_device.js's.
+// else on the device: a specialized RasterPS of RT64's took 2-8 s there, with no frame presented meanwhile. (On an Intel
+// adapter Chrome builds them in the background as elsewhere: what was slow there was the frames drawn meanwhile.)
 EM_JS(int, plume_webgpu_background_pipeline_builds, (), {
-    const vendor = (Module['plumeWebGPUAdapterInfo'] || {}).vendor || '';
-    const firefox = navigator.userAgent.includes('Firefox');
-    if (!firefox && vendor.toLowerCase() !== 'intel') {
+    if (!navigator.userAgent.includes('Firefox')) {
         return 1;
     }
-    console.log('plume: pipelines are built in line with the device here (' + (firefox ? 'Firefox' : 'Intel adapter') + ')');
+    console.log('plume: pipelines are built in line with the device here (Firefox)');
     return 0;
 });
 
