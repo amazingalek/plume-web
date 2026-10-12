@@ -1,6 +1,6 @@
 > [!WARNING]
 > **This is amazingalek/plume-web, a fork, not [plume](https://github.com/renderbag/plume).** It adds a WebGPU backend
-> to plume, built with Emscripten, for [recomp-web](https://github.com/amazingalek/recomp-web), and everything in it
+> to plume, built with Emscripten, for [N64Recomp-browser](https://github.com/amazingalek/N64Recomp-browser), and everything in it
 > past upstream's commits was written by AI (Claude). It is not made, endorsed or supported by plume's developers,
 > whose contributing guide bans any AI-made contribution and AI talking to its maintainers: nothing here is offered
 > upstream, and please don't take issues with this fork to them.
