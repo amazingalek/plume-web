@@ -1,3 +1,10 @@
+> [!WARNING]
+> **This is amazingalek/plume-web, a fork, not [plume](https://github.com/renderbag/plume).** It adds a WebGPU backend
+> to plume, built with Emscripten, for [recomp-web](https://github.com/amazingalek/recomp-web), and everything in it
+> past upstream's commits was written by AI (Claude). It is not made, endorsed or supported by plume's developers,
+> whose contributing guide bans any AI-made contribution and AI talking to its maintainers: nothing here is offered
+> upstream, and please don't take issues with this fork to them.
+
 plume is a low-level rendering hardware interface (RHI) designed to provide the lowest common denominator between modern graphics APIs like Direct3D 12, Vulkan and Metal. It is designed to be easy to integrate into existing projects, and it has a "bring your own compiler" mindset when it comes to shaders. The use of C++ is also limited to specific patterns such as usage of `unique_ptr` to pass along the responsibility of handling the lifetime of objects to the user of the library.
 
 The library was originally created to be used by [RT64](https://github.com/rt64/rt64) and has been refactored for wider use for other projects that need it. While feature-rich and stable, it is not considered to be production-ready or to have stable API until a few crucial components such as barrier management and texture transitions are further refined. Nevertheless, feel free to use the project if it fits your use case.
