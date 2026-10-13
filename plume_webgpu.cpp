@@ -1402,9 +1402,23 @@ namespace plume {
         return false;
     }
 
+    static void presentWorkDone(WGPUQueueWorkDoneStatus status, WGPUStringView message, void *userdata1, void *userdata2) {
+        std::shared_ptr<uint32_t> *presentsInFlight = static_cast<std::shared_ptr<uint32_t> *>(userdata1);
+        (**presentsInFlight)--;
+        delete presentsInFlight;
+    }
+
     // The browser shows the canvas when this thread returns to its event loop, so when the build can wait, this does
     // that until the next animation frame (or just once without vsync).
     bool WebGPUSwapChain::present(uint32_t textureIndex, RenderCommandSemaphore **waitSemaphores, uint32_t waitSemaphoreCount) {
+        // In flight until the GPU has done everything submitted so far, which ends with this frame.
+        (*presentsInFlight)++;
+        WGPUQueueWorkDoneCallbackInfo callbackInfo = WGPU_QUEUE_WORK_DONE_CALLBACK_INFO_INIT;
+        callbackInfo.mode = WGPUCallbackMode_AllowSpontaneous;
+        callbackInfo.callback = presentWorkDone;
+        callbackInfo.userdata1 = new std::shared_ptr<uint32_t>(presentsInFlight);
+        wgpuQueueOnSubmittedWorkDone(commandQueue->device->queue, callbackInfo);
+
         if (!canWait()) {
             return true;
         }
@@ -1423,7 +1437,19 @@ namespace plume {
         return true;
     }
 
-    void WebGPUSwapChain::wait() { }
+    void WebGPUSwapChain::wait() {
+        if (!canWait()) {
+            return;
+        }
+
+        while (!isWaitReady()) {
+            emscripten_sleep(1);
+        }
+    }
+
+    bool WebGPUSwapChain::isWaitReady() {
+        return *presentsInFlight < std::max(desc.maxFrameLatency, 2U);
+    }
 
     void WebGPUSwapChain::getCanvasSize(uint32_t &width, uint32_t &height) const {
         int canvasWidth = 0, canvasHeight = 0;
@@ -2415,6 +2441,7 @@ namespace plume {
         capabilities.triangleFan = false;
         capabilities.dynamicDepthBias = false;
         capabilities.queryPools = false;
+        capabilities.presentWait = true;
         capabilities.displayTiming = true;
         capabilities.backgroundPipelineBuilds = (plume_webgpu_background_pipeline_builds() != 0);
         description.name = "WebGPU";

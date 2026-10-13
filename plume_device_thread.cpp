@@ -688,8 +688,30 @@ namespace plume {
             return true;
         }
 
+        // The backend learns that a present's work is done in a callback on the device thread (WebGPU's), so this thread
+        // polls isWaitReady() between calls rather than holding the device thread, as map() does isMapReady().
         void wait() override {
-            runSync(thread, [&]() { inner->wait(); });
+            const std::thread::id caller = std::this_thread::get_id();
+            for (;;) {
+                const bool ready = runSync(thread, [&]() {
+                    if ((std::this_thread::get_id() != caller) && !inner->isWaitReady()) {
+                        return false;
+                    }
+
+                    inner->wait();
+                    return true;
+                });
+
+                if (ready) {
+                    return;
+                }
+
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+
+        bool isWaitReady() override {
+            return runSync(thread, [&]() { return inner->isWaitReady(); });
         }
 
         bool resize() override {

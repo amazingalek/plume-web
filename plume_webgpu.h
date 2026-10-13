@@ -53,6 +53,14 @@
 //   frame in flight. Otherwise present() returns at once and the caller has to give the thread back to the browser
 //   itself (emscripten_set_main_loop or similar). Behind plume_device_thread.h the device thread does that between any
 //   two of its tasks, and presents aren't paced.
+// - Nor does every browser hold the page back when the GPU falls behind: Firefox (157, on an Intel UHD laptop GPU)
+//   takes 60 frames a second whatever the GPU finishes, so its queue grew seconds deep and the page showed a frame or
+//   two a second. So a swap chain counts the presents whose work the GPU hasn't finished (onSubmittedWorkDone), and
+//   with presentWait, wait() holds the next present until fewer than the swap chain's maxFrameLatency (at least 2)
+//   are, and isWaitReady() says whether it would. Behind plume_device_thread.h the calling thread polls isWaitReady(),
+//   as it does isMapReady(); without threads, wait() waits when the build can. Not 1: Firefox calls back late, and with
+//   one frame in flight a GPU that could finish ~54 frames a second gave 38, against 46 with two and 47 with three
+//   (whose queue sat 50 ms behind against 33).
 // - The browser doesn't say what the display's refresh rate is, so a swap chain times the animation frames with a
 //   loop of its own on the device's thread, whatever its caller presents at, and reports displayTiming.
 // - Every call must come from the thread that owns the device's JavaScript object: WebGPU objects can't be shared
@@ -328,10 +336,14 @@ namespace plume {
         bool vsyncEnabled = true;
         WebGPUFrameTimer *frameTimer = nullptr;
 
+        // Presents whose work the GPU hasn't finished, shared with their callbacks, which can outlive the swap chain.
+        std::shared_ptr<uint32_t> presentsInFlight = std::make_shared<uint32_t>(0);
+
         WebGPUSwapChain(WebGPUCommandQueue *commandQueue, const RenderSwapChainDesc &desc);
         ~WebGPUSwapChain() override;
         bool present(uint32_t textureIndex, RenderCommandSemaphore **waitSemaphores, uint32_t waitSemaphoreCount) override;
         void wait() override;
+        bool isWaitReady() override;
         bool resize() override;
         bool needsResize() const override;
         void setVsyncEnabled(bool vsyncEnabled) override;

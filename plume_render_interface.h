@@ -97,6 +97,12 @@ namespace plume {
         virtual ~RenderSwapChain() { }
         virtual bool present(uint32_t textureIndex, RenderCommandSemaphore **waitSemaphores, uint32_t waitSemaphoreCount) = 0;
         virtual void wait() = 0;
+
+        // False while wait() would hold the caller, on a backend that can't block the thread it runs on to wait (WebGPU,
+        // which learns that a present's work is done in a callback on the device's thread). A thread other than the
+        // device's can wait for it to turn true.
+        virtual bool isWaitReady() { return true; }
+
         virtual bool resize() = 0;
         virtual bool needsResize() const = 0;
         virtual void setVsyncEnabled(bool vsyncEnabled) = 0;
