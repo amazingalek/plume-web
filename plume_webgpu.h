@@ -31,7 +31,9 @@
 //   calling thread polls isMapReady() while the device thread is back in its event loop, where the callback runs.
 //   Without threads, map() waits for it itself when the build can (ASYNCIFY or JSPI: emscripten_sleep() hands the
 //   thread back to its event loop). Either way execute, wait, map reads what the GPU wrote, as on the other backends.
-//   A build that can't wait gets whatever arrived before the call, possibly a submission old.
+//   A build that can't wait gets whatever arrived before the call, possibly a submission old. Firefox looks for
+//   finished work only after a submission or every 100 ms, so while a map (or a present, below) waits, an empty
+//   submission at most once a millisecond makes it look again (WebGPUDevice::pollQueue()).
 // - Formatted buffer views (texel buffers) don't exist. A formatted view binds its buffer as a read-only storage
 //   buffer of raw bytes, the binding padded to a multiple of 4, so the shader reads array<u32> and unpacks R8 or R16
 //   elements itself: element i of an n-byte format is at byte i * n, little-endian. A writable formatted view of
@@ -522,6 +524,7 @@ namespace plume {
         std::vector<WebGPUBuffer *> mappedBuffers;
         WGPUShaderModule clearShader = nullptr;
         std::unordered_map<std::string, WGPURenderPipeline> clearPipelines;
+        double lastPollTime = 0.0;
 
         WebGPUDevice(WebGPUInterface *renderInterface);
         ~WebGPUDevice() override;
@@ -551,6 +554,7 @@ namespace plume {
         bool endCapture() override;
         WGPUBindGroupLayout getBindGroupLayout(const std::string &key, const std::vector<WGPUBindGroupLayoutEntry> &entries);
         WGPUPipelineLayout getPipelineLayout(const std::vector<WGPUBindGroupLayout> &layouts);
+        void pollQueue();
         void flushMappedBuffers();
         WGPURenderPipeline getClearPipeline(const WebGPUFramebuffer *framebuffer, int32_t colorAttachment, bool clearDepth, bool clearStencil);
     };

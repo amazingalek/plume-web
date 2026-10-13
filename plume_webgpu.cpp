@@ -487,6 +487,7 @@ namespace plume {
 
         if (canWait()) {
             while (readback->pending) {
+                device->pollQueue();
                 emscripten_sleep(0);
             }
         }
@@ -496,7 +497,12 @@ namespace plume {
     }
 
     bool WebGPUBuffer::isMapReady() {
-        return (readback == nullptr) || !readback->pending;
+        if ((readback == nullptr) || !readback->pending) {
+            return true;
+        }
+
+        device->pollQueue();
+        return false;
     }
 
     void WebGPUBuffer::cancelReadback() {
@@ -1448,7 +1454,12 @@ namespace plume {
     }
 
     bool WebGPUSwapChain::isWaitReady() {
-        return *presentsInFlight < std::max(desc.maxFrameLatency, 2U);
+        if (*presentsInFlight < std::max(desc.maxFrameLatency, 2U)) {
+            return true;
+        }
+
+        commandQueue->device->pollQueue();
+        return false;
     }
 
     void WebGPUSwapChain::getCanvasSize(uint32_t &width, uint32_t &height) const {
@@ -2505,6 +2516,19 @@ namespace plume {
         WGPUPipelineLayout layout = wgpuDeviceCreatePipelineLayout(device, &layoutDesc);
         pipelineLayouts[layouts] = layout;
         return layout;
+    }
+
+    // Firefox's GPU process looks for finished GPU work, and calls mapAsync and onSubmittedWorkDone back, only after a
+    // submission or on a timer every 100 ms (POLL_TIME_MS in its WebGPUParent.cpp). A page that waits for one of those
+    // callbacks before it submits more, as a readback does, so waits for the timer whenever the GPU hadn't finished by
+    // the submission's own look, which on a slow GPU is every time. While something waits, an empty submission at most
+    // once a millisecond makes it look again.
+    void WebGPUDevice::pollQueue() {
+        const double now = emscripten_get_now();
+        if ((now - lastPollTime) >= 1.0) {
+            lastPollTime = now;
+            wgpuQueueSubmit(queue, 0, nullptr);
+        }
     }
 
     void WebGPUDevice::flushMappedBuffers() {
