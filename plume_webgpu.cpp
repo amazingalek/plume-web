@@ -1345,8 +1345,57 @@ namespace plume {
 
     // WebGPUSwapChain
 
-    // Keeps the last 60 intervals between animation frames, about a second of them, for getRefreshRate(). A gap of more
-    // than 100 ms is the page being hidden or its thread being busy, not the display.
+    // The display's rate from the last intervals between animation frames. Frames come a whole number of refreshes apart,
+    // but not all of them one: a page the GPU or its own thread holds back gets some two or three refreshes apart, which a
+    // median read as a slower display (20-39 on a 60 Hz one), and Firefox can deliver extra callbacks between them, 0.1-5
+    // ms after a frame, a quarter of them and more, which the shortest quarter read as hundreds of Hz. So each interval is
+    // tried as the display's period: the callbacks are merged into frames until a frame spans 0.9 of it, a quarter of
+    // those frames must be within 10% of it, and the period that puts the most frames 1-4 periods apart wins, the shorter
+    // on a tie. An extra callback merges into its frame there, and frames held back still sit on the period's grid. No
+    // period found keeps the rate read before.
+    static uint32_t displayRate(const WebGPUFrameTimer &timer) {
+        const std::vector<double> &intervals = timer.frameIntervals;
+        uint32_t bestScore = 0;
+        double bestPeriod = 0.0;
+        double bestRate = 0.0;
+        for (double period : intervals) {
+            uint32_t frames = 0;
+            uint32_t onTime = 0;
+            uint32_t score = 0;
+            double onTimeSum = 0.0;
+            double span = 0.0;
+            for (size_t i = 0; i < intervals.size(); i++) {
+                span += intervals[(timer.frameIntervalCursor + i) % intervals.size()];
+                if (span < 0.9 * period) {
+                    continue;
+                }
+
+                frames++;
+                if (std::abs(span - period) <= 0.1 * period) {
+                    onTime++;
+                    onTimeSum += span;
+                }
+
+                const double refreshes = std::round(span / period);
+                if ((refreshes <= 4.0) && (std::abs(span - refreshes * period) <= 0.1 * period)) {
+                    score++;
+                }
+
+                span = 0.0;
+            }
+
+            if ((4 * onTime >= frames) && ((score > bestScore) || ((score == bestScore) && (period < bestPeriod)))) {
+                bestScore = score;
+                bestPeriod = period;
+                bestRate = 1000.0 * onTime / onTimeSum;
+            }
+        }
+
+        return (bestScore > 0) ? uint32_t(std::lround(bestRate)) : timer.refreshRate;
+    }
+
+    // Keeps the last 60 intervals between animation frames, about a second of them, and the display's rate read from them
+    // for getRefreshRate(). A gap of more than 100 ms is the page being hidden or its thread being busy, not the display.
     static bool timeAnimationFrame(double time, void *userData) {
         WebGPUFrameTimer *timer = static_cast<WebGPUFrameTimer *>(userData);
         if (timer->stopped) {
@@ -1363,6 +1412,11 @@ namespace plume {
             else {
                 timer->frameIntervals[timer->frameIntervalCursor] = interval;
                 timer->frameIntervalCursor = (timer->frameIntervalCursor + 1) % IntervalCount;
+            }
+
+            // Until a few frames have been timed, 60 is what they run at on most displays.
+            if (timer->frameIntervals.size() >= 5) {
+                timer->refreshRate = displayRate(*timer);
             }
         }
 
@@ -1564,19 +1618,7 @@ namespace plume {
     }
 
     uint32_t WebGPUSwapChain::getRefreshRate() const {
-        // Until the animation frames have been timed, 60 is what they run at on most displays.
-        if (frameTimer->frameIntervals.size() < 5) {
-            return 60;
-        }
-
-        // The display's rate is the interval the frames come at when nothing holds them back. A page the GPU or its own
-        // thread holds back gets some frames two or three refreshes apart, which a median reads as a slower display:
-        // under load it sank and wandered (20, 30, 39 on a 60 Hz display), and every change restarts RT64's frame
-        // interpolation. So the rate comes from the shortest quarter of the intervals, which a page holds to fewer
-        // frames still reads as the display's.
-        std::vector<double> sorted = frameTimer->frameIntervals;
-        std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 4, sorted.end());
-        return uint32_t(std::lround(1000.0 / sorted[sorted.size() / 4]));
+        return frameTimer->refreshRate;
     }
 
     // WebGPUFramebuffer

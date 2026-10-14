@@ -317,13 +317,14 @@ namespace plume {
     struct WebGPUCommandSemaphore : RenderCommandSemaphore {
     };
 
-    // The intervals between the browser's animation frames, for getRefreshRate(). Its loop frees it on the first frame
-    // after the swap chain has stopped it.
+    // The intervals between the browser's animation frames and the display's rate read from them, for getRefreshRate().
+    // Its loop frees it on the first frame after the swap chain has stopped it.
     struct WebGPUFrameTimer {
         bool stopped = false;
         double lastFrameTime = 0.0;
         std::vector<double> frameIntervals;
         uint32_t frameIntervalCursor = 0;
+        uint32_t refreshRate = 60;
     };
 
     struct WebGPUSwapChain : RenderSwapChain {
