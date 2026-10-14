@@ -19,10 +19,10 @@
 //   on the calling side, under the caller's own locks or on another thread it waited for, reaches the backend first.
 // - A command list records on the calling thread, copying whatever its arguments point at, and is replayed into a
 //   backend command list on the device thread when it's executed. Recording never waits for the device thread.
-//   So an object deleted meanwhile is deleted on the device thread only once every command list begun before the
-//   delete has been executed, begun again or deleted: a list never replays without an object it recorded, or submits
-//   a texture already destroyed (WebGPU drops that command buffer). A game's hi-res texture pack reloading a texture
-//   during a frame did that.
+//   So an object deleted meanwhile is deleted on the device thread only once every command list that had recorded
+//   something by the delete has been executed, begun again or deleted: a list never replays without an object it
+//   recorded, or submits a texture already destroyed (WebGPU drops that command buffer). A game's hi-res texture pack
+//   reloading a texture during a frame did that.
 // - waitForCommandFence() waits for the device thread to run everything queued before it, then for the fence. On a
 //   backend whose fences are no-ops (WebGPU's), that is what makes it safe to reuse what the GPU work used.
 // - A swap chain hands out textures of its own, and present() copies the one drawn into the backend's swap chain

@@ -51,7 +51,7 @@ namespace plume {
 
     static HeldDestroys heldDestroys;
 
-    // Takes the destroys that no open list was begun before. With the mutex held.
+    // Takes the destroys that no open list was opened before. With the mutex held.
     static std::vector<std::function<void()>> takeReleasedDestroys() {
         std::vector<std::function<void()>> released;
         const uint64_t firstOpen = heldDestroys.open.empty() ? UINT64_MAX : *heldDestroys.open.begin();
