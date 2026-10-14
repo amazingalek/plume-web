@@ -1801,6 +1801,11 @@ namespace plume {
         bool presentWait = false;
         bool displayTiming = false;
 
+        // The format a swap chain presents in at least cost, for whoever creates one and draws into it. On WebGPU it's
+        // the browser's preferred canvas format, which it presents without a copy (Firefox copies any other one through
+        // the CPU).
+        RenderFormat preferredSwapChainFormat = RenderFormat::B8G8R8A8_UNORM;
+
         // Pipelines.
         // A pipeline built with buildInBackground leaves the device's other work running while it builds. Not so on
         // WebGPU in Firefox, whose GPU process builds it in line and presents nothing meanwhile.

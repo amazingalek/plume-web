@@ -29,6 +29,14 @@ EM_JS(int, plume_webgpu_background_pipeline_builds, (), {
     return 0;
 });
 
+// Whether the browser's preferred canvas format is bgra8unorm (rgba8unorm otherwise): the one it presents a canvas in
+// without a copy. Firefox (158, Windows) hands a canvas to its compositor as a shared texture only in bgra8unorm, and
+// reads any other format's frames back to the CPU and uploads them again: Rush 2049's page at 3840x2000 took its GPU
+// process 1.2 cores instead of 0.5 and the GPU 80% busy instead of 43% (RTX 2070). Chrome cost the same either way.
+EM_JS(int, plume_webgpu_bgra_swap_chain, (), {
+    return navigator.gpu.getPreferredCanvasFormat() === 'bgra8unorm' ? 1 : 0;
+});
+
 namespace plume {
     static const uint32_t PushConstantsAlignment = 256;
 
@@ -2460,6 +2468,7 @@ namespace plume {
         capabilities.presentWait = true;
         capabilities.displayTiming = true;
         capabilities.backgroundPipelineBuilds = (plume_webgpu_background_pipeline_builds() != 0);
+        capabilities.preferredSwapChainFormat = (plume_webgpu_bgra_swap_chain() != 0) ? RenderFormat::B8G8R8A8_UNORM : RenderFormat::R8G8B8A8_UNORM;
         description.name = "WebGPU";
     }
 
