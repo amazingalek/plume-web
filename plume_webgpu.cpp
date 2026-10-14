@@ -10,6 +10,7 @@
 #include "plume_webgpu.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -39,6 +40,13 @@ EM_JS(int, plume_webgpu_bgra_swap_chain, (), {
 
 namespace plume {
     static const uint32_t PushConstantsAlignment = 256;
+
+    // Unique to each WebGPU handle made, never reused as a handle's address can be: what the device's bind group cache
+    // knows a resource by.
+    static uint64_t newHandleSerial() {
+        static std::atomic<uint64_t> serial = 0;
+        return ++serial;
+    }
 
     static WGPUStringView toStringView(const std::string &str) {
         return { str.c_str(), str.size() };
@@ -375,6 +383,7 @@ namespace plume {
         }
 
         buffer = wgpuDeviceCreateBuffer(device->device, &bufferDesc);
+        handleSerial = newHandleSerial();
         if ((desc.heapType == RenderHeapType::UPLOAD) || (desc.heapType == RenderHeapType::GPU_UPLOAD) || (desc.heapType == RenderHeapType::READBACK)) {
             shadow.resize(bufferDesc.size, 0);
         }
@@ -575,6 +584,7 @@ namespace plume {
         }
 
         texture = wgpuDeviceCreateTexture(device->device, &textureDesc);
+        handleSerial = newHandleSerial();
     }
 
     WebGPUTexture::~WebGPUTexture() {
@@ -648,6 +658,7 @@ namespace plume {
         }
 
         view = wgpuTextureCreateView(texture->texture, &viewDesc);
+        handleSerial = newHandleSerial();
     }
 
     WebGPUTextureView::~WebGPUTextureView() {
@@ -682,6 +693,7 @@ namespace plume {
         const bool allLinear = (samplerDesc.magFilter == WGPUFilterMode_Linear) && (samplerDesc.minFilter == WGPUFilterMode_Linear) && (samplerDesc.mipmapFilter == WGPUMipmapFilterMode_Linear);
         samplerDesc.maxAnisotropy = (desc.anisotropyEnabled && allLinear) ? uint16_t(std::clamp(desc.maxAnisotropy, 1U, 16U)) : 1;
         sampler = wgpuDeviceCreateSampler(device->device, &samplerDesc);
+        handleSerial = newHandleSerial();
     }
 
     WebGPUSampler::~WebGPUSampler() {
@@ -857,6 +869,7 @@ namespace plume {
         layoutEntries.clear();
         groupEntries.clear();
         std::string key;
+        std::string entriesKey;
         for (const Binding &binding : bindings) {
             WGPUBindGroupLayoutEntry layoutEntry = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
             WGPUBindGroupEntry groupEntry = WGPU_BIND_GROUP_ENTRY_INIT;
@@ -974,6 +987,16 @@ namespace plume {
 
             key += entryKey;
             key += "v" + std::to_string(uint64_t(layoutEntry.visibility)) + ";";
+
+            // What the entry binds, for the device's bind group cache: a texture without a view binds its default one.
+            uint64_t serial = 0;
+            if (groupEntry.buffer != nullptr) serial = binding.buffer->handleSerial;
+            else if (groupEntry.sampler != nullptr) serial = binding.sampler->handleSerial;
+            else if (binding.textureView != nullptr) serial = binding.textureView->handleSerial;
+            else serial = binding.texture->handleSerial;
+            char boundKey[96];
+            snprintf(boundKey, sizeof(boundKey), "%u:%llu:%llu:%llu;", binding.binding, (unsigned long long)serial, (unsigned long long)groupEntry.offset, (unsigned long long)groupEntry.size);
+            entriesKey += boundKey;
             layoutEntries.emplace_back(layoutEntry);
             groupEntries.emplace_back(groupEntry);
         }
@@ -987,11 +1010,11 @@ namespace plume {
             wgpuBindGroupRelease(bindGroup);
         }
 
-        WGPUBindGroupDescriptor groupDesc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
-        groupDesc.layout = layout;
-        groupDesc.entryCount = groupEntries.size();
-        groupDesc.entries = groupEntries.data();
-        bindGroup = wgpuDeviceCreateBindGroup(device->device, &groupDesc);
+        // A layout lives as long as the device, so its address names it.
+        char layoutName[32];
+        snprintf(layoutName, sizeof(layoutName), "%p|", (void *)layout);
+        groupKey = layoutName + entriesKey;
+        bindGroup = device->getBindGroup(groupKey, layout, groupEntries);
         dirty = false;
     }
 
@@ -1018,11 +1041,8 @@ namespace plume {
             entry.buffer = buffer;
             entry.size = bindingSize;
             entries.emplace_back(entry);
-            WGPUBindGroupDescriptor groupDesc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
-            groupDesc.layout = getLayoutWithPushConstants();
-            groupDesc.entryCount = entries.size();
-            groupDesc.entries = entries.data();
-            group = wgpuDeviceCreateBindGroup(device->device, &groupDesc);
+            const std::string key = groupKey + "pushConstants:" + std::to_string(chunkId) + ":" + std::to_string(bindingSize);
+            group = device->getBindGroup(key, getLayoutWithPushConstants(), entries);
         }
 
         return group;
@@ -1604,6 +1624,7 @@ namespace plume {
         WebGPUTexture *texture = textures[nextTextureIndex].get();
         texture->releaseHandle();
         texture->texture = surfaceTexture.texture;
+        texture->handleSerial = newHandleSerial();
         *textureIndex = nextTextureIndex;
         nextTextureIndex = (nextTextureIndex + 1) % textures.size();
         return true;
@@ -2533,6 +2554,10 @@ namespace plume {
             wgpuPipelineLayoutRelease(it.second);
         }
 
+        for (auto &it : bindGroups) {
+            wgpuBindGroupRelease(it.second.first);
+        }
+
         for (auto &it : bindGroupLayouts) {
             wgpuBindGroupLayoutRelease(it.second);
         }
@@ -2558,6 +2583,34 @@ namespace plume {
         WGPUBindGroupLayout layout = wgpuDeviceCreateBindGroupLayout(device, &layoutDesc);
         bindGroupLayouts[key] = layout;
         return layout;
+    }
+
+    // A bind group with this key (the layout and what each entry binds) made before, or a new one, with a reference for
+    // the caller. The least recently used is released once there are more than BindGroupCacheSize.
+    WGPUBindGroup WebGPUDevice::getBindGroup(const std::string &key, WGPUBindGroupLayout layout, const std::vector<WGPUBindGroupEntry> &entries) {
+        auto it = bindGroups.find(key);
+        if (it != bindGroups.end()) {
+            bindGroupUses.splice(bindGroupUses.begin(), bindGroupUses, it->second.second);
+            wgpuBindGroupAddRef(it->second.first);
+            return it->second.first;
+        }
+
+        WGPUBindGroupDescriptor groupDesc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+        groupDesc.layout = layout;
+        groupDesc.entryCount = entries.size();
+        groupDesc.entries = entries.data();
+        WGPUBindGroup group = wgpuDeviceCreateBindGroup(device, &groupDesc);
+        bindGroupUses.push_front(key);
+        bindGroups[key] = { group, bindGroupUses.begin() };
+        if (bindGroups.size() > BindGroupCacheSize) {
+            auto oldest = bindGroups.find(bindGroupUses.back());
+            wgpuBindGroupRelease(oldest->second.first);
+            bindGroups.erase(oldest);
+            bindGroupUses.pop_back();
+        }
+
+        wgpuBindGroupAddRef(group);
+        return group;
     }
 
     WGPUPipelineLayout WebGPUDevice::getPipelineLayout(const std::vector<WGPUBindGroupLayout> &layouts) {

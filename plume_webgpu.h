@@ -17,6 +17,12 @@
 // - Bind group layouts need each texture's sample type and each sampler's filtering, which plume's descriptor
 //   ranges don't carry. So a descriptor set derives its layout from what is bound in it, and a pipeline is created
 //   at draw time for the layouts of the sets bound then, and cached per pipeline layout.
+// - A bind group can't be destroyed: the browser frees one once JavaScript has collected it. A renderer that rewrites
+//   its descriptor sets every frame makes thousands a second, and Firefox (158, D3D12) collected them only after
+//   ~150k had piled up, holding ~700k descriptors of its heap's million; past it, creating one fails with Out of
+//   Memory and the device is lost. Most of them bind what a set held a frame or two before, so the device keeps bind
+//   groups by their layout and what they bind (each handle's handleSerial, never reused), the most recently used
+//   BindGroupCacheSize of them, and a set takes its group from there (WebGPUDevice::getBindGroup()).
 // - Building a pipeline holds up the browser's GPU process (a large WGSL shader can take seconds), so a graphics
 //   pipeline created with buildInBackground is built with createRenderPipelineAsync for the WebGPU layouts draws
 //   with its plume layout have resolved to, and isReady() is false until every build has called back. Created before
@@ -92,6 +98,7 @@
 
 #include "plume_render_interface.h"
 
+#include <list>
 #include <map>
 #include <set>
 #include <unordered_map>
@@ -101,6 +108,7 @@
 namespace plume {
     static const uint32_t PushConstantsGroup = 3;
     static const uint32_t PushConstantsBinding = 999;
+    static const size_t BindGroupCacheSize = 4096;
 
     struct WebGPUBuffer;
     struct WebGPUCommandQueue;
@@ -130,6 +138,7 @@ namespace plume {
 
     struct WebGPUBuffer : RenderBuffer {
         WGPUBuffer buffer = nullptr;
+        uint64_t handleSerial = 0;
         WebGPUDevice *device = nullptr;
         RenderBufferDesc desc;
         std::vector<uint8_t> shadow;
@@ -153,6 +162,7 @@ namespace plume {
     struct WebGPUTexture : RenderTexture {
         WGPUTexture texture = nullptr;
         WGPUTextureView defaultView = nullptr;
+        uint64_t handleSerial = 0;
         WebGPUDevice *device = nullptr;
         RenderTextureDesc desc;
         bool ownsTexture = true;
@@ -168,6 +178,7 @@ namespace plume {
 
     struct WebGPUTextureView : RenderTextureView {
         WGPUTextureView view = nullptr;
+        uint64_t handleSerial = 0;
         const WebGPUTexture *texture = nullptr;
         RenderTextureViewDesc desc;
 
@@ -177,6 +188,7 @@ namespace plume {
 
     struct WebGPUSampler : RenderSampler {
         WGPUSampler sampler = nullptr;
+        uint64_t handleSerial = 0;
         RenderSamplerDesc desc;
 
         WebGPUSampler(WebGPUDevice *device, const RenderSamplerDesc &desc);
@@ -212,6 +224,7 @@ namespace plume {
         std::vector<WGPUBindGroupLayoutEntry> layoutEntries;
         std::vector<WGPUBindGroupEntry> groupEntries;
         std::string layoutKey;
+        std::string groupKey;
         WGPUBindGroupLayout layoutWithPushConstants = nullptr;
         std::map<std::pair<uint64_t, uint32_t>, WGPUBindGroup> groupsWithPushConstants;
         uint64_t bindingStagesRevision = 0;
@@ -519,6 +532,8 @@ namespace plume {
         WGPUBindGroupLayoutEntry pushConstantsEntry = {};
         WGPUBindGroupLayout pushConstantsLayout = nullptr;
         std::unordered_map<std::string, WGPUBindGroupLayout> bindGroupLayouts;
+        std::unordered_map<std::string, std::pair<WGPUBindGroup, std::list<std::string>::iterator>> bindGroups;
+        std::list<std::string> bindGroupUses;
         std::unordered_map<uint32_t, WGPUShaderStage> bindingStages;
         uint64_t bindingStagesRevision = 0;
         std::map<std::vector<WGPUBindGroupLayout>, WGPUPipelineLayout> pipelineLayouts;
@@ -554,6 +569,7 @@ namespace plume {
         bool beginCapture() override;
         bool endCapture() override;
         WGPUBindGroupLayout getBindGroupLayout(const std::string &key, const std::vector<WGPUBindGroupLayoutEntry> &entries);
+        WGPUBindGroup getBindGroup(const std::string &key, WGPUBindGroupLayout layout, const std::vector<WGPUBindGroupEntry> &entries);
         WGPUPipelineLayout getPipelineLayout(const std::vector<WGPUBindGroupLayout> &layouts);
         void pollQueue();
         void flushMappedBuffers();
