@@ -12,6 +12,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <deque>
+#include <mutex>
+#include <set>
 #include <thread>
 #include <type_traits>
 
@@ -34,12 +37,73 @@ namespace plume {
         }
     }
 
-    // Deletes a backend object on the device thread.
+    // A command list reaches the backend only when it's executed, so an object deleted while a list that recorded it
+    // waits to be executed would be gone when the list is replayed: a texture destroyed before the list's bind groups
+    // are submitted, which WebGPU answers by dropping the command buffer. So deleting a backend object waits until every
+    // command list that had recorded something by then has been executed, begun again or deleted: the lists that could
+    // have recorded it. One that starts recording after can't have, and one begun and left empty holds nothing back.
+    struct HeldDestroys {
+        std::mutex mutex;
+        uint64_t openCount = 0;
+        std::multiset<uint64_t> open;
+        std::deque<std::pair<uint64_t, std::function<void()>>> held;
+    };
+
+    static HeldDestroys heldDestroys;
+
+    // Takes the destroys that no open list was begun before. With the mutex held.
+    static std::vector<std::function<void()>> takeReleasedDestroys() {
+        std::vector<std::function<void()>> released;
+        const uint64_t firstOpen = heldDestroys.open.empty() ? UINT64_MAX : *heldDestroys.open.begin();
+        while (!heldDestroys.held.empty() && (heldDestroys.held.front().first < firstOpen)) {
+            released.emplace_back(std::move(heldDestroys.held.front().second));
+            heldDestroys.held.pop_front();
+        }
+
+        return released;
+    }
+
+    // A command list is open from its first command until it's executed, begun again or deleted. openSerial is 0 when
+    // it isn't.
+    static void setCommandListOpen(uint64_t &openSerial, bool open) {
+        std::vector<std::function<void()>> released;
+        {
+            std::lock_guard lock(heldDestroys.mutex);
+            if (openSerial != 0) {
+                heldDestroys.open.erase(heldDestroys.open.find(openSerial));
+                openSerial = 0;
+            }
+
+            if (open) {
+                openSerial = ++heldDestroys.openCount;
+                heldDestroys.open.insert(openSerial);
+            }
+
+            released = takeReleasedDestroys();
+        }
+
+        for (std::function<void()> &destroy : released) {
+            destroy();
+        }
+    }
+
+    // Deletes a backend object on the device thread, after the command lists that could have recorded it are executed.
     template<typename T>
     static void destroyAsync(DeviceThread *thread, T *object) {
-        if (object != nullptr) {
-            thread->runAsync([object]() { delete object; });
+        if (object == nullptr) {
+            return;
         }
+
+        std::function<void()> destroy = [thread, object]() { thread->runAsync([object]() { delete object; }); };
+        {
+            std::lock_guard lock(heldDestroys.mutex);
+            if (!heldDestroys.open.empty()) {
+                heldDestroys.held.emplace_back(heldDestroys.openCount, std::move(destroy));
+                return;
+            }
+        }
+
+        destroy();
     }
 
     struct DTDevice;
@@ -367,14 +431,22 @@ namespace plume {
         RenderCommandList *inner = nullptr;
         std::shared_ptr<Recording> recording;
         std::shared_ptr<const Recording> recorded;
+        uint64_t openSerial = 0;
         const DTPipelineLayout *computeLayout = nullptr;
         const DTPipelineLayout *graphicsLayout = nullptr;
 
         DTCommandList(DeviceThread *thread, std::unique_ptr<RenderCommandList> inner) : thread(thread), inner(inner.release()) { }
-        ~DTCommandList() override { destroyAsync(thread, inner); }
+        ~DTCommandList() override {
+            setCommandListOpen(openSerial, false);
+            destroyAsync(thread, inner);
+        }
 
         void record(Command &&command) {
             assert((recording != nullptr) && "The command list wasn't begun.");
+            if (openSerial == 0) {
+                setCommandListOpen(openSerial, true);
+            }
+
             recording->emplace_back(std::move(command));
         }
 
@@ -399,6 +471,7 @@ namespace plume {
         }
 
         void begin() override {
+            setCommandListOpen(openSerial, false);
             recording = std::make_shared<Recording>();
             computeLayout = nullptr;
             graphicsLayout = nullptr;
@@ -832,6 +905,11 @@ namespace plume {
 
                 queue->executeCommandLists(innerLists.data(), uint32_t(innerLists.size()), waits.data(), uint32_t(waits.size()), signals.data(), uint32_t(signals.size()), fence);
             });
+
+            // After the replay is queued, so whatever the lists recorded is deleted once they're submitted.
+            for (uint32_t i = 0; i < commandListCount; i++) {
+                setCommandListOpen(const_cast<DTCommandList *>(static_cast<const DTCommandList *>(commandLists[i]))->openSerial, false);
+            }
         }
 
         void waitForCommandFence(RenderCommandFence *fence) override {
