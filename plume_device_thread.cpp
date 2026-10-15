@@ -257,7 +257,12 @@ namespace plume {
 
         // Data the backend delivers asynchronously (WebGPU's READBACK buffers) arrives while the device thread is back
         // in its event loop, so this thread waits for the device thread's answer rather than holding the device thread.
-        // On the device thread itself, the backend's map() is all there is.
+        // It asks at most once a millisecond: the device thread answers at every replay and present by itself, and a
+        // question asked again as soon as the last answer said no had this thread asking as fast as the device thread
+        // answered, about 10 times a millisecond, each answer a look at the queue. In Chrome that filled the GPU
+        // process's main thread with as many tasks for as long as the data took, which held up the data and the page's
+        // presents with it: RT64's wait for a framebuffer's change count (Pilotwings 64's copies between framebuffers)
+        // made frame gaps of 100-130 ms. On the device thread itself, the backend's map() is all there is.
         void *map(uint32_t subresource, const RenderRange *readRange) override {
             if (mapState != nullptr) {
                 if (thread->isCurrent()) {
@@ -265,13 +270,19 @@ namespace plume {
                     return mapState->data;
                 }
 
+                std::chrono::steady_clock::time_point asked;
                 for (;;) {
                     const uint64_t counted = mapState->countAnswers();
                     if (mapState->isReady()) {
                         return mapState->data;
                     }
 
-                    mapState->ask(thread);
+                    const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+                    if ((now - asked) >= std::chrono::milliseconds(1)) {
+                        asked = now;
+                        mapState->ask(thread);
+                    }
+
                     mapState->waitForAnswer(counted);
                 }
             }
