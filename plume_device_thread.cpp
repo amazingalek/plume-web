@@ -238,8 +238,11 @@ namespace plume {
         DeviceThread *thread = nullptr;
         RenderBuffer *inner = nullptr;
         std::shared_ptr<DTMapState> mapState;
+        bool uploadHeap = false;
+        std::atomic<void *> uploadData = nullptr;
 
         DTBuffer(DeviceThread *thread, std::unique_ptr<RenderBuffer> inner, RenderHeapType heapType) : thread(thread), inner(inner.release()) {
+            uploadHeap = (heapType == RenderHeapType::UPLOAD) || (heapType == RenderHeapType::GPU_UPLOAD);
             if (heapType == RenderHeapType::READBACK) {
                 mapState = std::make_shared<DTMapState>();
                 mapState->inner = this->inner;
@@ -285,6 +288,22 @@ namespace plume {
 
                     mapState->waitForAnswer(counted);
                 }
+            }
+
+            // An upload buffer maps at the same address every time (WebGPU's is a copy in memory that unmap() writes to
+            // the buffer, Vulkan's and D3D12's stay mapped), so after its first map() the backend's is queued and the
+            // caller writes there at once. Each one waited for the device thread: RT64 maps ~30 a frame, 1,700 a second
+            // in Pilotwings 64's menus, each 0.1-0.2 ms behind the page's thread.
+            if (uploadHeap && (subresource == 0)) {
+                void *data = uploadData.load(std::memory_order_acquire);
+                if (data != nullptr) {
+                    thread->runAsync([buffer = inner]() { buffer->map(0, nullptr); });
+                    return data;
+                }
+
+                data = runSync(thread, [&]() { return inner->map(subresource, readRange); });
+                uploadData.store(data, std::memory_order_release);
+                return data;
             }
 
             const std::thread::id caller = std::this_thread::get_id();
@@ -354,27 +373,88 @@ namespace plume {
         ~DTTextureView() override { destroyAsync(thread, inner); }
     };
 
+    // A texture's backend object, which the device thread fills in when it makes it. A caller that needs it before then
+    // waits (unwrap()), and a task queued meanwhile reads it when it runs, after the texture was made.
+    struct DTTextureSlot {
+        RenderTexture *texture = nullptr;
+        std::atomic<bool> made = false;
+    };
+
+    static std::mutex texturesMadeMutex;
+    static std::condition_variable texturesMade;
+
+    // Deletes a texture's backend object, on the device thread.
+    struct DTTextureRelease {
+        std::shared_ptr<DTTextureSlot> slot;
+
+        ~DTTextureRelease() {
+            delete slot->texture;
+            slot->texture = nullptr;
+        }
+    };
+
     struct DTTexture : RenderTexture {
         DeviceThread *thread = nullptr;
-        RenderTexture *inner = nullptr;
+        std::shared_ptr<DTTextureSlot> slot = std::make_shared<DTTextureSlot>();
         bool ownsInner = true;
 
-        DTTexture(DeviceThread *thread, std::unique_ptr<RenderTexture> inner) : thread(thread), inner(inner.release()) { }
-        DTTexture(DeviceThread *thread) : thread(thread), ownsInner(false) { }
+        // One the swap chain fills in, on the device thread.
+        DTTexture(DeviceThread *thread) : thread(thread), ownsInner(false) {
+            slot->made = true;
+        }
+
+        // Makes the texture on the device thread, after whatever is queued before, and returns without waiting. RT64's
+        // texture cache makes two for each texture the game loads and waited for each: a screen with hundreds of new
+        // ones (a menu in Pilotwings 64) held the game's display lists 110-170 ms, in Chrome and Firefox alike.
+        DTTexture(DeviceThread *thread, std::function<std::unique_ptr<RenderTexture>()> &&make) : thread(thread) {
+            thread->runAsync([slot = slot, make = std::move(make)]() {
+                slot->texture = make().release();
+                {
+                    std::lock_guard lock(texturesMadeMutex);
+                    slot->made.store(true, std::memory_order_release);
+                }
+
+                texturesMade.notify_all();
+            });
+        }
 
         ~DTTexture() override {
             if (ownsInner) {
-                destroyAsync(thread, inner);
+                destroyAsync(thread, new DTTextureRelease{ std::move(slot) });
             }
         }
 
+        bool isMade() const {
+            return slot->made.load(std::memory_order_acquire);
+        }
+
+        // The backend object, once the device thread has made it.
+        RenderTexture *get() const {
+            if (!isMade()) {
+                if (thread->isCurrent()) {
+                    // Runs what is queued, which makes it.
+                    thread->runSync([]() { });
+                }
+                else {
+                    std::unique_lock lock(texturesMadeMutex);
+                    texturesMade.wait(lock, [&]() { return isMade(); });
+                }
+            }
+
+            return slot->texture;
+        }
+
         std::unique_ptr<RenderTextureView> createTextureView(const RenderTextureViewDesc &desc) const override {
-            std::unique_ptr<RenderTextureView> view = runSync(thread, [&]() { return inner->createTextureView(desc); });
+            std::unique_ptr<RenderTextureView> view = runSync(thread, [&]() { return slot->texture->createTextureView(desc); });
             return view ? std::make_unique<DTTextureView>(thread, std::move(view)) : nullptr;
         }
 
         void setName(const std::string &name) override {
-            thread->runAsync([texture = inner, name]() { texture->setName(name); });
+            thread->runAsync([slot = slot, name]() {
+                if (slot->texture != nullptr) {
+                    slot->texture->setName(name);
+                }
+            });
         }
     };
 
@@ -512,7 +592,7 @@ namespace plume {
 
     static RenderBuffer *unwrap(const RenderBuffer *object) { return unwrapAs<DTBuffer>(object); }
     static RenderBufferFormattedView *unwrap(const RenderBufferFormattedView *object) { return unwrapAs<DTBufferFormattedView>(object); }
-    static RenderTexture *unwrap(const RenderTexture *object) { return unwrapAs<DTTexture>(object); }
+    static RenderTexture *unwrap(const RenderTexture *object) { return (object != nullptr) ? static_cast<const DTTexture *>(object)->get() : nullptr; }
     static RenderTextureView *unwrap(const RenderTextureView *object) { return unwrapAs<DTTextureView>(object); }
     static RenderShader *unwrap(const RenderShader *object) { return unwrapAs<DTShader>(object); }
     static RenderSampler *unwrap(const RenderSampler *object) { return unwrapAs<DTSampler>(object); }
@@ -575,8 +655,12 @@ namespace plume {
         }
 
         void setTexture(uint32_t descriptorIndex, const RenderTexture *texture, RenderTextureLayout textureLayout, const RenderTextureView *textureView) override {
-            thread->runAsync([set = inner, descriptorIndex, innerTexture = unwrap(texture), textureLayout, innerView = unwrap(textureView)]() {
-                set->setTexture(descriptorIndex, innerTexture, textureLayout, innerView);
+            // A texture still being made is read from its slot when the write runs, which is after it's made.
+            const DTTexture *wrapper = static_cast<const DTTexture *>(texture);
+            std::shared_ptr<DTTextureSlot> slot = ((wrapper != nullptr) && !wrapper->isMade()) ? wrapper->slot : nullptr;
+            RenderTexture *innerTexture = (slot == nullptr) ? unwrap(texture) : nullptr;
+            thread->runAsync([set = inner, descriptorIndex, slot = std::move(slot), innerTexture, textureLayout, innerView = unwrap(textureView)]() {
+                set->setTexture(descriptorIndex, (slot != nullptr) ? slot->texture : innerTexture, textureLayout, innerView);
             });
         }
 
@@ -930,7 +1014,7 @@ namespace plume {
                     innerTextures[i] = innerDevice->createTexture(RenderTextureDesc::ColorTarget(width, height, desc.format));
                 }
 
-                textures[i]->inner = innerTextures[i].get();
+                textures[i]->slot->texture = innerTextures[i].get();
             }
         }
 
@@ -1160,6 +1244,19 @@ namespace plume {
         }
     };
 
+    // What makes a texture later on the device thread: the description with its clear value copied, since the caller's
+    // is gone by then.
+    template<typename F>
+    static std::function<std::unique_ptr<RenderTexture>()> makeTexture(const RenderTextureDesc &desc, F &&create) {
+        const bool cleared = (desc.optimizedClearValue != nullptr);
+        const RenderClearValue clearValue = cleared ? *desc.optimizedClearValue : RenderClearValue();
+        return [desc, cleared, clearValue, create = std::forward<F>(create)]() {
+            RenderTextureDesc copy = desc;
+            copy.optimizedClearValue = cleared ? &clearValue : nullptr;
+            return create(copy);
+        };
+    }
+
     // DTPool
 
     struct DTPool : RenderPool {
@@ -1175,8 +1272,7 @@ namespace plume {
         }
 
         std::unique_ptr<RenderTexture> createTexture(const RenderTextureDesc &desc) override {
-            std::unique_ptr<RenderTexture> texture = runSync(thread, [&]() { return inner->createTexture(desc); });
-            return texture ? std::make_unique<DTTexture>(thread, std::move(texture)) : nullptr;
+            return std::make_unique<DTTexture>(thread, makeTexture(desc, [pool = inner](const RenderTextureDesc &desc) { return pool->createTexture(desc); }));
         }
     };
 
@@ -1253,7 +1349,7 @@ namespace plume {
         }
 
         std::unique_ptr<RenderTexture> createTexture(const RenderTextureDesc &desc) override {
-            return create<DTTexture, RenderTexture>([&]() { return inner->createTexture(desc); });
+            return std::make_unique<DTTexture>(thread, makeTexture(desc, [device = inner](const RenderTextureDesc &desc) { return device->createTexture(desc); }));
         }
 
         std::unique_ptr<RenderAccelerationStructure> createAccelerationStructure(const RenderAccelerationStructureDesc &desc) override {

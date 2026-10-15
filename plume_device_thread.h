@@ -14,6 +14,9 @@
 //   caller waits. map() of a buffer whose data the backend delivers asynchronously waits on the calling side until
 //   isMapReady(), so the device thread keeps returning to its event loop meanwhile, and so does
 //   createGraphicsPipeline() for a pipeline the backend builds asynchronously, until its isReady().
+// - createTexture() and an upload buffer's map() after its first don't wait: the texture is made on the device thread
+//   after whatever is queued before, and a caller that needs its backend object first (recording it in a command list)
+//   waits then; the buffer is mapped at the address its first map() returned, and the backend's map() is queued.
 // - A READBACK buffer's isMapReady() doesn't wait for the device thread: after a copy into the buffer is replayed, the
 //   device thread checks it at each replay and present until the data is there, maps it and publishes the answer,
 //   which isMapReady() reads. Its map() waits for that answer, not behind everything queued on the device thread.
