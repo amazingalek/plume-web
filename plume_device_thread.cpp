@@ -10,7 +10,9 @@
 #include "plume_device_thread.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -118,17 +120,162 @@ namespace plume {
         ~DTBufferFormattedView() override { destroyAsync(thread, inner); }
     };
 
+    // Whether a READBACK buffer's data has arrived, answered on the device thread and read on any thread without waiting
+    // for it. A question that waited for the answer waited for the device thread to get through everything queued
+    // before it, the replay of every command list executed meanwhile, and a thread asking between other work (RT64 at
+    // each VI, whether a frame's copy to RAM can land) spent milliseconds a frame there. So the device thread answers on
+    // its own: after a command list that copies into the buffer is replayed, it checks the buffer at every replay and
+    // present until the data is there, maps it then, and publishes the answer with the pointer. isMapReady() reads the
+    // answer, and it counts only for the executions queued: one from before the last execution that copies into the
+    // buffer was replayed is about the data before it. A caller that finds no answer asks once more, for a device thread
+    // with nothing else to do.
+    struct DTMapState : std::enable_shared_from_this<DTMapState> {
+        // On the device thread: the backend's buffer (null once deleted), whether it's mapped, and the executions that
+        // copy into it replayed.
+        RenderBuffer *inner = nullptr;
+        bool mapped = false;
+        uint64_t replayed = 0;
+
+        // The executions queued that copy into the buffer, and the last answer: the executions replayed before it,
+        // shifted left once, and 1 if the data had arrived. The data's pointer when it had.
+        std::atomic<uint64_t> executions = 0;
+        std::atomic<uint64_t> answer = 0;
+        std::atomic<bool> asking = false;
+        std::atomic<void *> data = nullptr;
+
+        // Each answer wakes a map() waiting for one.
+        std::mutex answerMutex;
+        std::condition_variable answerCondition;
+        uint64_t answerCount = 0;
+
+        bool isReady() const {
+            return answer == ((executions << 1) | 1);
+        }
+
+        void ask(DeviceThread *thread);
+        bool check();
+
+        // On the device thread.
+        void map() {
+            if (!mapped && (inner != nullptr)) {
+                data = inner->map(0, nullptr);
+                mapped = true;
+            }
+        }
+
+        // On the device thread.
+        void unmap(uint32_t subresource, const RenderRange *writtenRange) {
+            if (mapped && (inner != nullptr)) {
+                inner->unmap(subresource, writtenRange);
+            }
+
+            mapped = false;
+        }
+
+        // Waits for an answer after the one counted, or a millisecond.
+        void waitForAnswer(uint64_t counted) {
+            std::unique_lock lock(answerMutex);
+            answerCondition.wait_for(lock, std::chrono::milliseconds(1), [&]() { return answerCount != counted; });
+        }
+
+        uint64_t countAnswers() {
+            std::lock_guard lock(answerMutex);
+            return answerCount;
+        }
+    };
+
+    // On a device thread: the READBACK buffers whose data hasn't arrived since their last copy was replayed.
+    static thread_local std::vector<std::shared_ptr<DTMapState>> pendingReadbacks;
+
+    static void checkPendingReadbacks() {
+        pendingReadbacks.erase(std::remove_if(pendingReadbacks.begin(), pendingReadbacks.end(), [](const std::shared_ptr<DTMapState> &state) { return state->check(); }), pendingReadbacks.end());
+    }
+
+    void DTMapState::ask(DeviceThread *thread) {
+        bool idle = false;
+        if (asking.compare_exchange_strong(idle, true)) {
+            thread->runAsync([state = shared_from_this()]() {
+                state->asking = false;
+                if (std::find(pendingReadbacks.begin(), pendingReadbacks.end(), state) == pendingReadbacks.end()) {
+                    state->check();
+                }
+
+                checkPendingReadbacks();
+            });
+        }
+    }
+
+    // On the device thread: answers whether the data the replayed copies wrote has arrived, and maps the buffer if it
+    // has. Returns whether the buffer needs no more checks.
+    bool DTMapState::check() {
+        const bool ready = (inner != nullptr) && inner->isMapReady();
+        if (ready) {
+            map();
+        }
+
+        answer = (replayed << 1) | (ready ? 1 : 0);
+        {
+            std::lock_guard lock(answerMutex);
+            answerCount++;
+        }
+
+        answerCondition.notify_all();
+        return ready || (inner == nullptr);
+    }
+
+    // Deletes a READBACK buffer's backend buffer, on the device thread, and leaves its state without one.
+    struct DTMapRelease {
+        std::shared_ptr<DTMapState> state;
+
+        ~DTMapRelease() {
+            state->unmap(0, nullptr);
+            delete state->inner;
+            state->inner = nullptr;
+        }
+    };
+
     struct DTBuffer : RenderBuffer {
         DeviceThread *thread = nullptr;
         RenderBuffer *inner = nullptr;
+        std::shared_ptr<DTMapState> mapState;
 
-        DTBuffer(DeviceThread *thread, std::unique_ptr<RenderBuffer> inner) : thread(thread), inner(inner.release()) { }
-        ~DTBuffer() override { destroyAsync(thread, inner); }
+        DTBuffer(DeviceThread *thread, std::unique_ptr<RenderBuffer> inner, RenderHeapType heapType) : thread(thread), inner(inner.release()) {
+            if (heapType == RenderHeapType::READBACK) {
+                mapState = std::make_shared<DTMapState>();
+                mapState->inner = this->inner;
+            }
+        }
+
+        ~DTBuffer() override {
+            if (mapState != nullptr) {
+                destroyAsync(thread, new DTMapRelease{ mapState });
+            }
+            else {
+                destroyAsync(thread, inner);
+            }
+        }
 
         // Data the backend delivers asynchronously (WebGPU's READBACK buffers) arrives while the device thread is back
-        // in its event loop, so this thread polls isMapReady() between calls rather than holding the device thread. On
-        // the device thread itself, the backend's map() is all there is.
+        // in its event loop, so this thread waits for the device thread's answer rather than holding the device thread.
+        // On the device thread itself, the backend's map() is all there is.
         void *map(uint32_t subresource, const RenderRange *readRange) override {
+            if (mapState != nullptr) {
+                if (thread->isCurrent()) {
+                    mapState->map();
+                    return mapState->data;
+                }
+
+                for (;;) {
+                    const uint64_t counted = mapState->countAnswers();
+                    if (mapState->isReady()) {
+                        return mapState->data;
+                    }
+
+                    mapState->ask(thread);
+                    mapState->waitForAnswer(counted);
+                }
+            }
+
             const std::thread::id caller = std::this_thread::get_id();
             for (;;) {
                 void *data = nullptr;
@@ -150,6 +297,15 @@ namespace plume {
         }
 
         bool isMapReady() override {
+            if (mapState != nullptr) {
+                if (mapState->isReady()) {
+                    return true;
+                }
+
+                mapState->ask(thread);
+                return false;
+            }
+
             return runSync(thread, [&]() { return inner->isMapReady(); });
         }
 
@@ -157,7 +313,12 @@ namespace plume {
             RenderBuffer *buffer = inner;
             const bool ranged = (writtenRange != nullptr);
             const RenderRange range = ranged ? *writtenRange : RenderRange();
-            thread->runAsync([=]() { buffer->unmap(subresource, ranged ? &range : nullptr); });
+            if (mapState != nullptr) {
+                thread->runAsync([state = mapState, subresource, ranged, range]() { state->unmap(subresource, ranged ? &range : nullptr); });
+            }
+            else {
+                thread->runAsync([=]() { buffer->unmap(subresource, ranged ? &range : nullptr); });
+            }
         }
 
         std::unique_ptr<RenderBufferFormattedView> createBufferFormattedView(RenderFormat format) override {
@@ -431,6 +592,8 @@ namespace plume {
         RenderCommandList *inner = nullptr;
         std::shared_ptr<Recording> recording;
         std::shared_ptr<const Recording> recorded;
+        std::vector<std::shared_ptr<DTMapState>> readbacks;
+        std::vector<std::shared_ptr<DTMapState>> recordedReadbacks;
         uint64_t openSerial = 0;
         const DTPipelineLayout *computeLayout = nullptr;
         const DTPipelineLayout *graphicsLayout = nullptr;
@@ -448,6 +611,18 @@ namespace plume {
             }
 
             recording->emplace_back(std::move(command));
+        }
+
+        // A copy into a READBACK buffer, whose answers to isMapReady() count only once this list is executed.
+        void recordReadback(const RenderBuffer *buffer) {
+            if (buffer == nullptr) {
+                return;
+            }
+
+            const std::shared_ptr<DTMapState> &state = static_cast<const DTBuffer *>(buffer)->mapState;
+            if ((state != nullptr) && (std::find(readbacks.begin(), readbacks.end(), state) == readbacks.end())) {
+                readbacks.emplace_back(state);
+            }
         }
 
         // Replays the last recording into the backend's command list. On the device thread.
@@ -473,6 +648,7 @@ namespace plume {
         void begin() override {
             setCommandListOpen(openSerial, false);
             recording = std::make_shared<Recording>();
+            readbacks.clear();
             computeLayout = nullptr;
             graphicsLayout = nullptr;
         }
@@ -480,6 +656,8 @@ namespace plume {
         void end() override {
             recorded = std::move(recording);
             recording.reset();
+            recordedReadbacks = std::move(readbacks);
+            readbacks.clear();
         }
 
         void barriers(RenderBarrierStages stages, const RenderBufferBarrier *bufferBarriers, uint32_t bufferBarriersCount, const RenderTextureBarrier *textureBarriers, uint32_t textureBarriersCount) override {
@@ -610,10 +788,12 @@ namespace plume {
         }
 
         void copyBufferRegion(RenderBufferReference dstBuffer, RenderBufferReference srcBuffer, uint64_t size) override {
+            recordReadback(dstBuffer.ref);
             record([dst = unwrap(dstBuffer), src = unwrap(srcBuffer), size](RenderCommandList *c) { c->copyBufferRegion(dst, src, size); });
         }
 
         void copyTextureRegion(const RenderTextureCopyLocation &dstLocation, const RenderTextureCopyLocation &srcLocation, uint32_t dstX, uint32_t dstY, uint32_t dstZ, const RenderBox *srcBox) override {
+            recordReadback(dstLocation.buffer);
             RenderTextureCopyLocation dst = dstLocation;
             dst.texture = unwrap(dst.texture);
             dst.buffer = unwrap(dst.buffer);
@@ -626,6 +806,7 @@ namespace plume {
         }
 
         void copyBuffer(const RenderBuffer *dstBuffer, const RenderBuffer *srcBuffer) override {
+            recordReadback(dstBuffer);
             record([dst = unwrap(dstBuffer), src = unwrap(srcBuffer)](RenderCommandList *c) { c->copyBuffer(dst, src); });
         }
 
@@ -756,6 +937,7 @@ namespace plume {
                 const RenderCommandList *commandList = copyList.get();
                 innerQueue->executeCommandLists(&commandList, 1, waits.data(), uint32_t(waits.size()), &signal, 1);
                 inner->present(innerIndex, &signal, 1);
+                checkPendingReadbacks();
             });
 
             return true;
@@ -890,13 +1072,20 @@ namespace plume {
             };
 
             std::vector<Execution> executions;
+            std::vector<std::shared_ptr<DTMapState>> readbacks;
             for (uint32_t i = 0; i < commandListCount; i++) {
                 const DTCommandList *commandList = static_cast<const DTCommandList *>(commandLists[i]);
                 assert((commandList->recorded != nullptr) && "The command list wasn't ended.");
                 executions.push_back({ commandList->inner, commandList->recorded });
+                readbacks.insert(readbacks.end(), commandList->recordedReadbacks.begin(), commandList->recordedReadbacks.end());
             }
 
-            thread->runAsync([queue = inner, executions = std::move(executions), waits = unwrap(waitSemaphores, waitSemaphoreCount), signals = unwrap(signalSemaphores, signalSemaphoreCount), fence = unwrap(signalFence)]() mutable {
+            thread->runAsync([queue = inner, executions = std::move(executions), readbacks, waits = unwrap(waitSemaphores, waitSemaphoreCount), signals = unwrap(signalSemaphores, signalSemaphoreCount), fence = unwrap(signalFence)]() mutable {
+                // A buffer that was mapped when its last data arrived, and that the caller never mapped and unmapped.
+                for (const std::shared_ptr<DTMapState> &state : readbacks) {
+                    state->unmap(0, nullptr);
+                }
+
                 std::vector<const RenderCommandList *> innerLists;
                 for (const Execution &execution : executions) {
                     DTCommandList::replay(execution.commandList, *execution.recording);
@@ -904,7 +1093,20 @@ namespace plume {
                 }
 
                 queue->executeCommandLists(innerLists.data(), uint32_t(innerLists.size()), waits.data(), uint32_t(waits.size()), signals.data(), uint32_t(signals.size()), fence);
+                for (const std::shared_ptr<DTMapState> &state : readbacks) {
+                    state->replayed++;
+                    if (std::find(pendingReadbacks.begin(), pendingReadbacks.end(), state) == pendingReadbacks.end()) {
+                        pendingReadbacks.emplace_back(state);
+                    }
+                }
+
+                checkPendingReadbacks();
             });
+
+            // Once the replay is queued: an answer counts only after it.
+            for (const std::shared_ptr<DTMapState> &state : readbacks) {
+                state->executions++;
+            }
 
             // After the replay is queued, so whatever the lists recorded is deleted once they're submitted.
             for (uint32_t i = 0; i < commandListCount; i++) {
@@ -928,7 +1130,7 @@ namespace plume {
 
         std::unique_ptr<RenderBuffer> createBuffer(const RenderBufferDesc &desc) override {
             std::unique_ptr<RenderBuffer> buffer = runSync(thread, [&]() { return inner->createBuffer(desc); });
-            return buffer ? std::make_unique<DTBuffer>(thread, std::move(buffer)) : nullptr;
+            return buffer ? std::make_unique<DTBuffer>(thread, std::move(buffer), desc.heapType) : nullptr;
         }
 
         std::unique_ptr<RenderTexture> createTexture(const RenderTextureDesc &desc) override {
@@ -1005,7 +1207,8 @@ namespace plume {
         }
 
         std::unique_ptr<RenderBuffer> createBuffer(const RenderBufferDesc &desc) override {
-            return create<DTBuffer, RenderBuffer>([&]() { return inner->createBuffer(desc); });
+            std::unique_ptr<RenderBuffer> buffer = runSync(thread, [&]() { return inner->createBuffer(desc); });
+            return buffer ? std::make_unique<DTBuffer>(thread, std::move(buffer), desc.heapType) : nullptr;
         }
 
         std::unique_ptr<RenderTexture> createTexture(const RenderTextureDesc &desc) override {
@@ -1154,7 +1357,7 @@ namespace plume {
 
         EmscriptenDeviceThread(pthread_t thread) : thread(thread) { }
 
-        bool isCurrent() const {
+        bool isCurrent() const override {
             return pthread_equal(pthread_self(), thread);
         }
 

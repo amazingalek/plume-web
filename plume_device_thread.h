@@ -14,6 +14,9 @@
 //   device thread while the caller waits. map() of a buffer whose data the backend delivers asynchronously waits on
 //   the calling side until isMapReady(), so the device thread keeps returning to its event loop meanwhile, and so
 //   does createGraphicsPipeline() for a pipeline the backend builds asynchronously, until its isReady().
+// - A READBACK buffer's isMapReady() doesn't wait for the device thread: after a copy into the buffer is replayed, the
+//   device thread checks it at each replay and present until the data is there, maps it and publishes the answer,
+//   which isMapReady() reads. Its map() waits for that answer, not behind everything queued on the device thread.
 // - A call that returns nothing (unmap(), setName(), descriptor writes, executeCommandLists(), present(), destroying
 //   an object) is queued and the caller goes on. The queue is first in, first out, so whatever happened before a call
 //   on the calling side, under the caller's own locks or on another thread it waited for, reaches the backend first.
@@ -56,6 +59,9 @@ namespace plume {
 
         // Queues work to run on the device thread after everything queued before it, and returns.
         virtual void runAsync(std::function<void()> &&work) = 0;
+
+        // Whether the calling thread is the device thread.
+        virtual bool isCurrent() const = 0;
     };
 
     // Creates the backend on the device thread with createInterface, and returns an interface that runs it there.
