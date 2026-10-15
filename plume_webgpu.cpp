@@ -1459,6 +1459,9 @@ namespace plume {
         return true;
     }
 
+    // The most presents in flight adaptPresentsInFlight() tries, and what uncapped keeps.
+    static const uint32_t kMaxPresentsInFlight = 4;
+
     WebGPUSwapChain::WebGPUSwapChain(WebGPUCommandQueue *commandQueue, const RenderSwapChainDesc &desc) {
         assert(commandQueue != nullptr);
         assert(desc.renderWindow != nullptr);
@@ -1495,6 +1498,24 @@ namespace plume {
         if ((presentsInFlightQuery >= 1) && (presentsInFlightQuery <= 8)) {
             maxPresentsInFlight = uint32_t(presentsInFlightQuery);
             presentsInFlightFixed = true;
+        }
+
+        // uncapped[=<rate>] measures how fast a page can present, not how it plays: the display's rate is reported as
+        // <rate> (360 without a number, 60-1000), so a caller that interpolates to it (RT64) draws as many frames as the
+        // GPU and the browser take, and 4 stay in flight unless presents-in-flight says otherwise, so that a callback
+        // that comes back late doesn't hold them. present() still waits for an animation frame, so the browser's frames
+        // must be uncapped too: Chrome with --disable-frame-rate-limit, Firefox with layout.frame_rate 0 (a test page's
+        // animation frames, a WebGPU clear each, came 3,115 and 814 a second that way, 61 without, in Chrome 155 and
+        // Firefox 158).
+        const int uncappedQuery = plume_webgpu_query_number("uncapped");
+        if (uncappedQuery >= 0) {
+            uncappedRate = (uncappedQuery == 0) ? 360U : uint32_t(std::clamp(uncappedQuery, 60, 1000));
+            if (!presentsInFlightFixed) {
+                maxPresentsInFlight = kMaxPresentsInFlight;
+                presentsInFlightFixed = true;
+            }
+
+            printf("plume: uncapped, the display reported as %u Hz, at most %u presents in flight\n", uncappedRate, maxPresentsInFlight);
         }
 
         presentStats = (plume_webgpu_query_number("present-stats") >= 0);
@@ -1612,7 +1633,6 @@ namespace plume {
     // gains nothing from it, only a deeper queue, so it goes back, and the next try comes after 10 s, twice as long
     // each time (2 min at most). A done signal that comes back late gains from it. A number kept stays: a GPU that
     // later becomes the limit is left with at most 2 more frames queued than before.
-    static const uint32_t kMaxPresentsInFlight = 4;
 
     void WebGPUSwapChain::adaptPresentsInFlight() {
         const double now = emscripten_get_now();
@@ -1802,7 +1822,7 @@ namespace plume {
     }
 
     uint32_t WebGPUSwapChain::getRefreshRate() const {
-        return frameTimer->refreshRate;
+        return (uncappedRate > 0) ? uncappedRate : frameTimer->refreshRate;
     }
 
     // WebGPUFramebuffer

@@ -78,7 +78,9 @@
 //   a rise. The page's query can fix the number (presents-in-flight=<1-8>), and
 //   present-stats prints a line every 5 s: presents a second, how long after its present each frame's onSubmittedWorkDone
 //   came back, the time wait() held presents, and the animation frames a second, and each try that goes back. On a GPU
-//   at hand, that says whether the GPU, the callbacks or the browser's frames hold presents back.
+//   at hand, that says whether the GPU, the callbacks or the browser's frames hold presents back. uncapped=<rate>
+//   reports the display's rate as <rate> (360) and keeps 4 in flight, to measure how many presents a second a page can
+//   make with the browser's own frames uncapped (the swap chain's constructor says how).
 // - The browser doesn't say what the display's refresh rate is, so a swap chain times the animation frames with a
 //   loop of its own on the device's thread, whatever its caller presents at, and reports displayTiming.
 // - Every call must come from the thread that owns the device's JavaScript object: WebGPU objects can't be shared
@@ -370,6 +372,7 @@ namespace plume {
         uint32_t height = 0;
         bool vsyncEnabled = true;
         WebGPUFrameTimer *frameTimer = nullptr;
+        uint32_t uncappedRate = 0;
 
         std::shared_ptr<WebGPUPresentState> presentState = std::make_shared<WebGPUPresentState>();
         uint32_t maxPresentsInFlight = 2;
