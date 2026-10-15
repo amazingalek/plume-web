@@ -68,7 +68,10 @@
 //   are, and isWaitReady() says whether it would. Behind plume_device_thread.h the calling thread polls isWaitReady(),
 //   as it does isMapReady(); without threads, wait() waits when the build can. Not 1: Firefox calls back late, and with
 //   one frame in flight a GPU that could finish ~54 frames a second gave 38, against 46 with two and 47 with three
-//   (whose queue sat 50 ms behind against 33).
+//   (whose queue sat 50 ms behind against 33). The page's query can set that number (presents-in-flight=<1-8>), and
+//   present-stats prints a line every 5 s: presents a second, how long after its present each frame's onSubmittedWorkDone
+//   came back, the time wait() held presents, and the animation frames a second. On a GPU at hand, that says whether the
+//   GPU, the callbacks or the browser's frames hold presents back.
 // - The browser doesn't say what the display's refresh rate is, so a swap chain times the animation frames with a
 //   loop of its own on the device's thread, whatever its caller presents at, and reports displayTiming.
 // - Every call must come from the thread that owns the device's JavaScript object: WebGPU objects can't be shared
@@ -338,6 +341,15 @@ namespace plume {
         std::vector<double> frameIntervals;
         uint32_t frameIntervalCursor = 0;
         uint32_t refreshRate = 60;
+        uint32_t frameCount = 0;
+    };
+
+    // The presents whose work the GPU hasn't finished, and for present-stats how long each one's took to be reported
+    // done. Shared with their callbacks, which can outlive the swap chain.
+    struct WebGPUPresentState {
+        uint32_t inFlight = 0;
+        bool timeWorkDone = false;
+        std::vector<double> workDoneMs;
     };
 
     struct WebGPUSwapChain : RenderSwapChain {
@@ -352,8 +364,16 @@ namespace plume {
         bool vsyncEnabled = true;
         WebGPUFrameTimer *frameTimer = nullptr;
 
-        // Presents whose work the GPU hasn't finished, shared with their callbacks, which can outlive the swap chain.
-        std::shared_ptr<uint32_t> presentsInFlight = std::make_shared<uint32_t>(0);
+        std::shared_ptr<WebGPUPresentState> presentState = std::make_shared<WebGPUPresentState>();
+        uint32_t maxPresentsInFlight = 2;
+        double waitStartTime = 0.0;
+
+        // present-stats: what happened since statsStartTime.
+        bool presentStats = false;
+        double statsStartTime = 0.0;
+        uint32_t statsPresents = 0;
+        uint32_t statsFrameCount = 0;
+        double statsWaitMs = 0.0;
 
         WebGPUSwapChain(WebGPUCommandQueue *commandQueue, const RenderSwapChainDesc &desc);
         ~WebGPUSwapChain() override;
@@ -373,6 +393,7 @@ namespace plume {
         bool isEmpty() const override;
         uint32_t getRefreshRate() const override;
         void getCanvasSize(uint32_t &width, uint32_t &height) const;
+        void reportPresentStats();
     };
 
     struct WebGPUFramebuffer : RenderFramebuffer {

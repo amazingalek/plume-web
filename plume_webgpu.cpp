@@ -38,6 +38,16 @@ EM_JS(int, plume_webgpu_bgra_swap_chain, (), {
     return navigator.gpu.getPreferredCanvasFormat() === 'bgra8unorm' ? 1 : 0;
 });
 
+// A number from the page's query: -1 without the name, 0 for one with no number (present-stats).
+EM_JS(int, plume_webgpu_query_number, (const char *name), {
+    const value = new URLSearchParams(globalThis.location ? location.search : '').get(UTF8ToString(name));
+    if (value === null) {
+        return -1;
+    }
+    const number = parseInt(value, 10);
+    return isNaN(number) ? 0 : number;
+});
+
 namespace plume {
     static const uint32_t PushConstantsAlignment = 256;
 
@@ -1423,6 +1433,7 @@ namespace plume {
             return false;
         }
 
+        timer->frameCount++;
         const double interval = time - timer->lastFrameTime;
         if ((timer->lastFrameTime > 0.0) && (interval > 0.0) && (interval < 100.0)) {
             const uint32_t IntervalCount = 60;
@@ -1474,6 +1485,18 @@ namespace plume {
 
         frameTimer = new WebGPUFrameTimer();
         emscripten_request_animation_frame_loop(timeAnimationFrame, frameTimer);
+
+        maxPresentsInFlight = std::max(desc.maxFrameLatency, 2U);
+        const int presentsInFlightQuery = plume_webgpu_query_number("presents-in-flight");
+        if ((presentsInFlightQuery >= 1) && (presentsInFlightQuery <= 8)) {
+            maxPresentsInFlight = uint32_t(presentsInFlightQuery);
+        }
+
+        presentStats = (plume_webgpu_query_number("present-stats") >= 0);
+        presentState->timeWorkDone = presentStats;
+        if (presentStats || (presentsInFlightQuery >= 0)) {
+            printf("plume: at most %u presents in flight\n", maxPresentsInFlight);
+        }
     }
 
     WebGPUSwapChain::~WebGPUSwapChain() {
@@ -1490,22 +1513,36 @@ namespace plume {
         return false;
     }
 
+    struct WebGPUPresentWork {
+        std::shared_ptr<WebGPUPresentState> state;
+        double presentTime;
+    };
+
     static void presentWorkDone(WGPUQueueWorkDoneStatus status, WGPUStringView message, void *userdata1, void *userdata2) {
-        std::shared_ptr<uint32_t> *presentsInFlight = static_cast<std::shared_ptr<uint32_t> *>(userdata1);
-        (**presentsInFlight)--;
-        delete presentsInFlight;
+        WebGPUPresentWork *work = static_cast<WebGPUPresentWork *>(userdata1);
+        work->state->inFlight--;
+        if (work->state->timeWorkDone) {
+            work->state->workDoneMs.emplace_back(emscripten_get_now() - work->presentTime);
+        }
+
+        delete work;
     }
 
     // The browser shows the canvas when this thread returns to its event loop, so when the build can wait, this does
     // that until the next animation frame (or just once without vsync).
     bool WebGPUSwapChain::present(uint32_t textureIndex, RenderCommandSemaphore **waitSemaphores, uint32_t waitSemaphoreCount) {
         // In flight until the GPU has done everything submitted so far, which ends with this frame.
-        (*presentsInFlight)++;
+        presentState->inFlight++;
         WGPUQueueWorkDoneCallbackInfo callbackInfo = WGPU_QUEUE_WORK_DONE_CALLBACK_INFO_INIT;
         callbackInfo.mode = WGPUCallbackMode_AllowSpontaneous;
         callbackInfo.callback = presentWorkDone;
-        callbackInfo.userdata1 = new std::shared_ptr<uint32_t>(presentsInFlight);
+        callbackInfo.userdata1 = new WebGPUPresentWork{ presentState, emscripten_get_now() };
         wgpuQueueOnSubmittedWorkDone(commandQueue->device->queue, callbackInfo);
+
+        if (presentStats) {
+            statsPresents++;
+            reportPresentStats();
+        }
 
         if (!canWait()) {
             return true;
@@ -1536,12 +1573,56 @@ namespace plume {
     }
 
     bool WebGPUSwapChain::isWaitReady() {
-        if (*presentsInFlight < std::max(desc.maxFrameLatency, 2U)) {
+        if (presentState->inFlight < maxPresentsInFlight) {
+            if (waitStartTime > 0.0) {
+                statsWaitMs += emscripten_get_now() - waitStartTime;
+                waitStartTime = 0.0;
+            }
+
             return true;
+        }
+
+        if (waitStartTime == 0.0) {
+            waitStartTime = emscripten_get_now();
         }
 
         commandQueue->device->pollQueue();
         return false;
+    }
+
+    // present-stats' line, every 5 s.
+    void WebGPUSwapChain::reportPresentStats() {
+        const double now = emscripten_get_now();
+        if (statsStartTime == 0.0) {
+            statsStartTime = now;
+            statsPresents = 0;
+            statsFrameCount = frameTimer->frameCount;
+            statsWaitMs = 0.0;
+            presentState->workDoneMs.clear();
+            return;
+        }
+
+        const double seconds = (now - statsStartTime) / 1000.0;
+        if (seconds < 5.0) {
+            return;
+        }
+
+        std::vector<double> &workDoneMs = presentState->workDoneMs;
+        std::sort(workDoneMs.begin(), workDoneMs.end());
+        auto quantile = [&](double q) {
+            return workDoneMs.empty() ? 0.0 : workDoneMs[std::min(size_t(q * workDoneMs.size()), workDoneMs.size() - 1)];
+        };
+
+        printf("plume: %.1f presents a second, each done on the GPU %.0f ms after it (median; %.0f at p90, %.0f at most), "
+            "%.0f ms a second waiting for fewer than %u in flight, %.1f animation frames a second (display read as %u Hz)\n",
+            statsPresents / seconds, quantile(0.5), quantile(0.9), quantile(1.0), statsWaitMs / seconds, maxPresentsInFlight,
+            (frameTimer->frameCount - statsFrameCount) / seconds, frameTimer->refreshRate);
+
+        statsStartTime = now;
+        statsPresents = 0;
+        statsFrameCount = frameTimer->frameCount;
+        statsWaitMs = 0.0;
+        workDoneMs.clear();
     }
 
     void WebGPUSwapChain::getCanvasSize(uint32_t &width, uint32_t &height) const {
