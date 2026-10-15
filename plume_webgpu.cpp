@@ -1490,6 +1490,7 @@ namespace plume {
         const int presentsInFlightQuery = plume_webgpu_query_number("presents-in-flight");
         if ((presentsInFlightQuery >= 1) && (presentsInFlightQuery <= 8)) {
             maxPresentsInFlight = uint32_t(presentsInFlightQuery);
+            presentsInFlightFixed = true;
         }
 
         presentStats = (plume_webgpu_query_number("present-stats") >= 0);
@@ -1544,6 +1545,11 @@ namespace plume {
             reportPresentStats();
         }
 
+        if (!presentsInFlightFixed) {
+            capWindowPresents++;
+            adaptPresentsInFlight();
+        }
+
         if (!canWait()) {
             return true;
         }
@@ -1575,7 +1581,9 @@ namespace plume {
     bool WebGPUSwapChain::isWaitReady() {
         if (presentState->inFlight < maxPresentsInFlight) {
             if (waitStartTime > 0.0) {
-                statsWaitMs += emscripten_get_now() - waitStartTime;
+                const double waitedMs = emscripten_get_now() - waitStartTime;
+                statsWaitMs += waitedMs;
+                capWaitMs += waitedMs;
                 waitStartTime = 0.0;
             }
 
@@ -1588,6 +1596,58 @@ namespace plume {
 
         commandQueue->device->pollQueue();
         return false;
+    }
+
+    // Every 2 s: while wait() held presents for more than 5% of the time and they fell short of the display's rate, one
+    // more in flight is tried, and kept if presents rose by 8% or reached the display's rate. A GPU that is the limit
+    // gains nothing from it, only a deeper queue, so it goes back, and the next try comes after 10 s, twice as long
+    // each time (2 min at most). A done signal that comes back late gains from it. A number kept stays: a GPU that
+    // later becomes the limit is left with at most 2 more frames queued than before.
+    static const uint32_t kMaxPresentsInFlight = 4;
+
+    void WebGPUSwapChain::adaptPresentsInFlight() {
+        const double now = emscripten_get_now();
+        if (capWindowStart == 0.0) {
+            capWindowStart = now;
+            capWindowPresents = 0;
+            capWaitMs = 0.0;
+            return;
+        }
+
+        const double seconds = (now - capWindowStart) / 1000.0;
+        if (seconds < 2.0) {
+            return;
+        }
+
+        const double rate = capWindowPresents / seconds;
+        const double displayRate = frameTimer->refreshRate;
+        const bool held = (capWaitMs > (50.0 * seconds)) && (rate < (displayRate * 0.95));
+        if (capTrying) {
+            capTrying = false;
+            if ((rate >= (capTryRate * 1.08)) || (rate >= (displayRate * 0.95))) {
+                capRetryMs = 10000.0;
+                printf("plume: %u presents in flight (%.1f a second, from %.1f)\n", maxPresentsInFlight, rate, capTryRate);
+            }
+            else {
+                if (presentStats) {
+                    printf("plume: back to %u presents in flight (%.1f a second with one more, %.1f without)\n",
+                        maxPresentsInFlight - 1, rate, capTryRate);
+                }
+
+                maxPresentsInFlight--;
+                capNextTry = now + capRetryMs;
+                capRetryMs = std::min(capRetryMs * 2.0, 120000.0);
+            }
+        }
+        else if (held && (maxPresentsInFlight < kMaxPresentsInFlight) && (now >= capNextTry)) {
+            capTryRate = rate;
+            capTrying = true;
+            maxPresentsInFlight++;
+        }
+
+        capWindowStart = now;
+        capWindowPresents = 0;
+        capWaitMs = 0.0;
     }
 
     // present-stats' line, every 5 s.

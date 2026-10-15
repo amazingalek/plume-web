@@ -68,10 +68,16 @@
 //   are, and isWaitReady() says whether it would. Behind plume_device_thread.h the calling thread polls isWaitReady(),
 //   as it does isMapReady(); without threads, wait() waits when the build can. Not 1: Firefox calls back late, and with
 //   one frame in flight a GPU that could finish ~54 frames a second gave 38, against 46 with two and 47 with three
-//   (whose queue sat 50 ms behind against 33). The page's query can set that number (presents-in-flight=<1-8>), and
+//   (whose queue sat 50 ms behind against 33). Nor always 2: where the callback comes back later than two frames, two
+//   in flight hold presents below the display's rate with the GPU idle, and RT64 reads the presents it skips as the GPU
+//   falling behind and paces them to the game's frames. With each callback held 20-40 ms (an RTX 2070's Firefox gives
+//   11-16 ms; a laptop's Intel graphics is suspected of more), Firefox 158 drew Banjo-Kazooie at 20 a second with 2 in
+//   flight, 58 with 3 and 59 with 4. The callbacks alone can't tell a late callback from a slow GPU, but only the first
+//   gains from one more in flight, so while wait() holds presents a swap chain tries one more, up to 4, and keeps it if
+//   presents rise (adaptPresentsInFlight()). The page's query can fix the number (presents-in-flight=<1-8>), and
 //   present-stats prints a line every 5 s: presents a second, how long after its present each frame's onSubmittedWorkDone
-//   came back, the time wait() held presents, and the animation frames a second. On a GPU at hand, that says whether the
-//   GPU, the callbacks or the browser's frames hold presents back.
+//   came back, the time wait() held presents, and the animation frames a second, and each try that goes back. On a GPU
+//   at hand, that says whether the GPU, the callbacks or the browser's frames hold presents back.
 // - The browser doesn't say what the display's refresh rate is, so a swap chain times the animation frames with a
 //   loop of its own on the device's thread, whatever its caller presents at, and reports displayTiming.
 // - Every call must come from the thread that owns the device's JavaScript object: WebGPU objects can't be shared
@@ -368,6 +374,16 @@ namespace plume {
         uint32_t maxPresentsInFlight = 2;
         double waitStartTime = 0.0;
 
+        // The number in flight tried one higher while wait() holds presents, and kept only if presents rise with it.
+        bool presentsInFlightFixed = false;
+        double capWindowStart = 0.0;
+        uint32_t capWindowPresents = 0;
+        double capWaitMs = 0.0;
+        double capTryRate = 0.0;
+        bool capTrying = false;
+        double capNextTry = 0.0;
+        double capRetryMs = 10000.0;
+
         // present-stats: what happened since statsStartTime.
         bool presentStats = false;
         double statsStartTime = 0.0;
@@ -394,6 +410,7 @@ namespace plume {
         uint32_t getRefreshRate() const override;
         void getCanvasSize(uint32_t &width, uint32_t &height) const;
         void reportPresentStats();
+        void adaptPresentsInFlight();
     };
 
     struct WebGPUFramebuffer : RenderFramebuffer {
