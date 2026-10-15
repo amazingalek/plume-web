@@ -867,6 +867,13 @@ namespace plume {
         uint32_t nextTextureIndex = 0;
         bool vsyncEnabled = true;
 
+        // What needsResize() and getRefreshRate() answer: the backend's answers at the last present, resize or refresh on
+        // the device thread. A caller that waited for them each frame waited behind everything queued before (RT64's
+        // present thread asks both before every present), so it reads these and queues a refresh instead.
+        mutable std::atomic<bool> innerNeedsResize = false;
+        mutable std::atomic<uint32_t> innerRefreshRate = 0;
+        mutable std::atomic<bool> refreshing = false;
+
         // On the device thread.
         DTSwapChain(DeviceThread *thread, RenderDevice *innerDevice, RenderCommandQueue *innerQueue, std::unique_ptr<RenderSwapChain> inner, const RenderSwapChainDesc &desc)
             : thread(thread), innerDevice(innerDevice), innerQueue(innerQueue), inner(inner.release()), desc(desc)
@@ -882,6 +889,7 @@ namespace plume {
 
             innerTextures.resize(textures.size());
             updateTextures();
+            publish();
         }
 
         ~DTSwapChain() override {
@@ -915,10 +923,28 @@ namespace plume {
             }
         }
 
+        // On the device thread.
+        void publish() const {
+            innerNeedsResize = inner->needsResize();
+            innerRefreshRate = inner->getRefreshRate();
+        }
+
+        // Queues a publish(), unless one is queued already.
+        void refresh() const {
+            bool idle = false;
+            if (refreshing.compare_exchange_strong(idle, true)) {
+                thread->runAsync([this]() {
+                    refreshing = false;
+                    publish();
+                });
+            }
+        }
+
         bool present(uint32_t textureIndex, RenderCommandSemaphore **waitSemaphores, uint32_t waitSemaphoreCount) override {
             assert(textureIndex < textures.size());
             std::vector<RenderCommandSemaphore *> waits = unwrap(waitSemaphores, waitSemaphoreCount);
             thread->runAsync([this, textureIndex, waits]() mutable {
+                publish();
                 RenderTexture *source = innerTextures[textureIndex].get();
                 uint32_t innerIndex = 0;
                 if ((source == nullptr) || !inner->acquireTexture(acquireSemaphore.get(), &innerIndex)) {
@@ -973,12 +999,15 @@ namespace plume {
             return runSync(thread, [&]() {
                 const bool resized = inner->resize();
                 updateTextures();
+                publish();
                 return resized;
             });
         }
 
+        // The answer a present or a refresh ago: a window resized is seen at most one of them late.
         bool needsResize() const override {
-            return runSync(thread, [&]() { return inner->needsResize(); });
+            refresh();
+            return innerNeedsResize;
         }
 
         void setVsyncEnabled(bool vsyncEnabled) override {
@@ -1035,7 +1064,8 @@ namespace plume {
         }
 
         uint32_t getRefreshRate() const override {
-            return runSync(thread, [&]() { return inner->getRefreshRate(); });
+            refresh();
+            return innerRefreshRate;
         }
     };
 

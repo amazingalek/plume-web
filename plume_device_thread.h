@@ -10,10 +10,10 @@
 // worker (or the page) that made it. Any number of threads may call it, and the calls reach the backend on the device
 // thread in the order they were made.
 //
-// - A call that returns something (create*(), map(), a swap chain's resize() and needsResize(), ...) runs on the
-//   device thread while the caller waits. map() of a buffer whose data the backend delivers asynchronously waits on
-//   the calling side until isMapReady(), so the device thread keeps returning to its event loop meanwhile, and so
-//   does createGraphicsPipeline() for a pipeline the backend builds asynchronously, until its isReady().
+// - A call that returns something (create*(), map(), a swap chain's resize(), ...) runs on the device thread while the
+//   caller waits. map() of a buffer whose data the backend delivers asynchronously waits on the calling side until
+//   isMapReady(), so the device thread keeps returning to its event loop meanwhile, and so does
+//   createGraphicsPipeline() for a pipeline the backend builds asynchronously, until its isReady().
 // - A READBACK buffer's isMapReady() doesn't wait for the device thread: after a copy into the buffer is replayed, the
 //   device thread checks it at each replay and present until the data is there, maps it and publishes the answer,
 //   which isMapReady() reads. Its map() waits for that answer, not behind everything queued on the device thread.
@@ -32,7 +32,8 @@
 //   texture: acquire, copy and present run as one task on the device thread. A browser shows the canvas between two
 //   tasks of its event loop whenever it updates the rendering, so a canvas texture acquired in one task can be gone
 //   by the next. That costs a copy of the window each present. wait() polls the backend's isWaitReady() from the
-//   calling thread, as map() does isMapReady().
+//   calling thread, as map() does isMapReady(). needsResize() and getRefreshRate() don't wait for the device thread:
+//   they answer what the backend said at the last present, resize() or refresh, and queue a refresh.
 // - On the device thread itself, everything runs in place, after whatever is queued.
 // - Raytracing and acceleration structures aren't forwarded: WebGPU has neither.
 //
