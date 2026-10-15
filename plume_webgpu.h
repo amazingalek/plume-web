@@ -74,7 +74,8 @@
 //   11-16 ms; a laptop's Intel graphics is suspected of more), Firefox 158 drew Banjo-Kazooie at 20 a second with 2 in
 //   flight, 58 with 3 and 59 with 4. The callbacks alone can't tell a late callback from a slow GPU, but only the first
 //   gains from one more in flight, so while wait() holds presents a swap chain tries one more, up to 4, and keeps it if
-//   presents rise (adaptPresentsInFlight()). The page's query can fix the number (presents-in-flight=<1-8>), and
+//   presents rise (adaptPresentsInFlight()), but only from presents steady before the try: after a stall any recovery is
+//   a rise. The page's query can fix the number (presents-in-flight=<1-8>), and
 //   present-stats prints a line every 5 s: presents a second, how long after its present each frame's onSubmittedWorkDone
 //   came back, the time wait() held presents, and the animation frames a second, and each try that goes back. On a GPU
 //   at hand, that says whether the GPU, the callbacks or the browser's frames hold presents back.
@@ -379,6 +380,8 @@ namespace plume {
         double capWindowStart = 0.0;
         uint32_t capWindowPresents = 0;
         double capWaitMs = 0.0;
+        double capLastPresent = 0.0;
+        double capLongestGapMs = 0.0;
         double capTryRate = 0.0;
         bool capTrying = false;
         double capNextTry = 0.0;

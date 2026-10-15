@@ -1602,8 +1602,13 @@ namespace plume {
         return false;
     }
 
-    // Every 2 s: while wait() held presents for more than 5% of the time and they fell short of the display's rate, one
-    // more in flight is tried, and kept if presents rose by 8% or reached the display's rate. A GPU that is the limit
+    // Every 2 s: while wait() held presents for more than 10% of the time and they fell short of the display's rate, one
+    // more in flight is tried, and kept if presents rose by 8% or reached the display's rate. Only from a steady window,
+    // with no present more than 100 ms after the one before: one with a stall in it (a load, a wait for shaders, Chrome's
+    // GPU process building a pipeline) is held by the stall, not the cap, and whatever follows it reads as a rise.
+    // GoldenEye's page in Chrome went to 3 from a window at 0.8 presents a second in its launcher, and from one at 48
+    // while its shaders built behind the game, each with a callback hundreds of ms late. Nor for less than 10%: that
+    // build's stalls held GoldenEye's presents 20-60 ms a second, where late callbacks held Banjo's 160 and Rush 2049's 800. A GPU that is the limit
     // gains nothing from it, only a deeper queue, so it goes back, and the next try comes after 10 s, twice as long
     // each time (2 min at most). A done signal that comes back late gains from it. A number kept stays: a GPU that
     // later becomes the limit is left with at most 2 more frames queued than before.
@@ -1611,10 +1616,16 @@ namespace plume {
 
     void WebGPUSwapChain::adaptPresentsInFlight() {
         const double now = emscripten_get_now();
+        if (capLastPresent > 0.0) {
+            capLongestGapMs = std::max(capLongestGapMs, now - capLastPresent);
+        }
+
+        capLastPresent = now;
         if (capWindowStart == 0.0) {
             capWindowStart = now;
             capWindowPresents = 0;
             capWaitMs = 0.0;
+            capLongestGapMs = 0.0;
             return;
         }
 
@@ -1625,7 +1636,7 @@ namespace plume {
 
         const double rate = capWindowPresents / seconds;
         const double displayRate = frameTimer->refreshRate;
-        const bool held = (capWaitMs > (50.0 * seconds)) && (rate < (displayRate * 0.95));
+        const bool held = (capLongestGapMs <= 100.0) && (capWaitMs > (100.0 * seconds)) && (rate < (displayRate * 0.95));
         if (capTrying) {
             capTrying = false;
             if ((rate >= (capTryRate * 1.08)) || (rate >= (displayRate * 0.95))) {
@@ -1644,6 +1655,12 @@ namespace plume {
             }
         }
         else if (held && (maxPresentsInFlight < kMaxPresentsInFlight) && (now >= capNextTry)) {
+            if (presentStats) {
+                printf("plume: trying %u presents in flight (%.1f a second, %.0f ms a second waiting, "
+                    "at most %.0f ms between two)\n",
+                    maxPresentsInFlight + 1, rate, capWaitMs / seconds, capLongestGapMs);
+            }
+
             capTryRate = rate;
             capTrying = true;
             maxPresentsInFlight++;
@@ -1652,6 +1669,7 @@ namespace plume {
         capWindowStart = now;
         capWindowPresents = 0;
         capWaitMs = 0.0;
+        capLongestGapMs = 0.0;
     }
 
     // present-stats' line, every 5 s.
