@@ -441,11 +441,41 @@ namespace plume {
             uint32_t used = 0;
         };
 
+        // The pipeline layout the last draw or dispatch resolved its bindings to, and what from: while none of it changes,
+        // the next one's is the same. Each set's layout too, since another command list may have updated a set since.
+        struct ResolvedBindings {
+            const WebGPUPipelineLayout *layout = nullptr;
+            WebGPUDescriptorSet *descriptorSets[MaxDescriptorSets] = {};
+            WGPUBindGroupLayout setLayouts[MaxDescriptorSets] = {};
+            uint64_t bindingStagesRevision = 0;
+            WGPUPipelineLayout pipelineLayout = nullptr;
+        };
+
         struct BindState {
             const WebGPUPipelineLayout *layout = nullptr;
             WebGPUDescriptorSet *descriptorSets[MaxDescriptorSets] = {};
             std::vector<uint8_t> pushConstants;
             bool pushConstantsDirty = false;
+            ResolvedBindings resolved;
+        };
+
+        // What the open render pass has been given, so that a draw passes on only what changed: on a page each call is a
+        // trip through JavaScript into the browser's GPU client on the page's thread, which a slow CPU runs out of first.
+        // The pipeline and the groups are held (a reference each), so that one released meanwhile can't come back as
+        // another object at the same address. A new pass starts with nothing set.
+        struct PassState {
+            WGPURenderPipeline pipeline = nullptr;
+            WGPUBindGroup bindGroups[MaxDescriptorSets] = {};
+            uint32_t stencilReference = 0;
+            bool stencilReferenceSet = false;
+            RenderVertexBufferView vertexBuffers[MaxVertexBuffers] = {};
+            RenderIndexBufferView indexBuffer;
+            bool indexBufferSet = false;
+            RenderViewport viewport;
+            bool viewportSet = false;
+            RenderRect scissor;
+            bool scissorSet = false;
+            bool blendConstantSet = false;
         };
 
         WebGPUDevice *device = nullptr;
@@ -469,6 +499,7 @@ namespace plume {
         bool viewportSet = false;
         bool scissorSet = false;
         bool renderStateDirty = true;
+        PassState pass;
         std::vector<PushConstantsChunk> pushConstantsChunks;
         uint32_t pushConstantsChunkIndex = 0;
 
@@ -516,6 +547,8 @@ namespace plume {
 
         void endRenderPass();
         bool beginRenderPass();
+        void resetPassState();
+        void setPassPipeline(WGPURenderPipeline renderPipeline);
         void clearRects(int32_t colorAttachment, const RenderColor &color, bool clearDepth, bool clearStencil, float depthValue, uint32_t stencilValue, const RenderRect *rects, uint32_t rectCount);
         void copiedInto(const RenderBuffer *buffer);
         bool prepareDraw();

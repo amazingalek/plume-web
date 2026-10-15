@@ -43,21 +43,35 @@ Module['preRun'].push(() => {
 
 // emdawnwebgpu hands setBindGroup its dynamic offsets as the whole wasm heap (HEAPU32) with a start and a length.
 // Firefox refuses any ArrayBuffer or view larger than 2 GB as an argument, so on a page whose heap has grown past that
-// every bind group with dynamic offsets threw and nothing was drawn. A view that big is replaced by a copy of only the
-// offsets; Chrome, and any heap under 2 GB, take the call as before. (writeBuffer and writeTexture already pass a
+// every bind group with dynamic offsets threw and nothing was drawn. There a view that big is replaced by the offsets
+// copied into an array kept for it; any heap under 2 GB takes the call as before. Chrome takes the whole heap, and
+// its pages call the browser's own setBindGroup: RT64 binds a group with an offset for every draw, and a wrapper with
+// a copy took ~1.4 us a call in Chrome 155 against 0.13 straight (a 3 GB heap; 0.48 under 2 GB), ~9% of the page's
+// thread in Conker's Bad Fur Day with that thread slowed 3 times. (writeBuffer and writeTexture already pass a
 // subarray.)
-for (const name of ['GPUComputePassEncoder', 'GPURenderPassEncoder', 'GPURenderBundleEncoder']) {
-  const encoder = globalThis[name];
-  if (!encoder) {
-    continue;
-  }
-
-  const setBindGroup = encoder.prototype.setBindGroup;
-  encoder.prototype.setBindGroup = function (index, bindGroup, offsets, start, length) {
-    if (offsets && offsets.byteLength > 0x7fffffff) {
-      return setBindGroup.call(this, index, bindGroup, offsets.slice(start, start + length));
+if (navigator.userAgent.includes('Firefox')) {
+  const copied = new Uint32Array(64);
+  for (const name of ['GPUComputePassEncoder', 'GPURenderPassEncoder', 'GPURenderBundleEncoder']) {
+    const encoder = globalThis[name];
+    if (!encoder) {
+      continue;
     }
 
-    return setBindGroup.apply(this, arguments);
-  };
+    const setBindGroup = encoder.prototype.setBindGroup;
+    encoder.prototype.setBindGroup = function (index, bindGroup, offsets, start, length) {
+      if (offsets && (offsets.byteLength > 0x7fffffff) && (length <= copied.length)) {
+        for (let i = 0; i < length; i++) {
+          copied[i] = offsets[start + i];
+        }
+
+        return setBindGroup.call(this, index, bindGroup, copied, 0, length);
+      }
+
+      if (offsets && (offsets.byteLength > 0x7fffffff)) {
+        return setBindGroup.call(this, index, bindGroup, offsets.slice(start, start + length));
+      }
+
+      return setBindGroup.apply(this, arguments);
+    };
+  }
 }
