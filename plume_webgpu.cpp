@@ -48,6 +48,33 @@ EM_JS(int, plume_webgpu_query_number, (const char *name), {
     return isNaN(number) ? 0 : number;
 });
 
+// A canvas's drawing buffer is replaced with a black one whenever its width or height is set or its context configured,
+// and the browser shows that until a frame is presented in it. SDL sets the size in its resize handler, and a swap chain
+// is resized from a call that presents nothing, so each size a window went through was black for a frame or more, and
+// the frames presented meanwhile were copied into a canvas of the other size (a black edge, or a copy WebGPU refused):
+// going fullscreen, a few sizes in a row, flickered for a second or two. So the canvas keeps its buffer's size: its
+// width and height read and write the size asked for, and the buffer takes that size only in plume_webgpu_size_canvas(),
+// which acquireTexture() calls in the same task as the frame it then presents. Until then the browser stretches the
+// last frame to the canvas's box.
+EM_JS(void, plume_webgpu_hold_canvas_size, (const char *selector), {
+    const canvas = document.querySelector(UTF8ToString(selector));
+    if (!canvas || canvas.plumeSize) {
+        return;
+    }
+    const size = canvas.plumeSize = { width: canvas.width, height: canvas.height };
+    for (const name of ['width', 'height']) {
+        Object.defineProperty(canvas, name, { configurable: true, get: () => size[name], set: (value) => { size[name] = value >>> 0; } });
+    }
+});
+
+EM_JS(void, plume_webgpu_size_canvas, (const char *selector, uint32_t width, uint32_t height), {
+    const canvas = document.querySelector(UTF8ToString(selector));
+    if (canvas) {
+        Object.getOwnPropertyDescriptor(HTMLCanvasElement.prototype, 'width').set.call(canvas, width);
+        Object.getOwnPropertyDescriptor(HTMLCanvasElement.prototype, 'height').set.call(canvas, height);
+    }
+});
+
 namespace plume {
     static const uint32_t PushConstantsAlignment = 256;
 
@@ -1478,6 +1505,7 @@ namespace plume {
         WGPUInstance instance = wgpuCreateInstance(nullptr);
         surface = wgpuInstanceCreateSurface(instance, &surfaceDesc);
         wgpuInstanceRelease(instance);
+        plume_webgpu_hold_canvas_size(selector.c_str());
 
         // The canvas hands out a new texture every frame, so the swap chain's textures are proxies that acquireTexture()
         // points at it.
@@ -1734,21 +1762,12 @@ namespace plume {
         height = uint32_t(std::max(canvasHeight, 0));
     }
 
+    // The surface takes the new size at the next acquireTexture(), with the canvas's buffer.
     bool WebGPUSwapChain::resize() {
         getCanvasSize(width, height);
         if (isEmpty()) {
             return false;
         }
-
-        WGPUSurfaceConfiguration config = WGPU_SURFACE_CONFIGURATION_INIT;
-        config.device = commandQueue->device->device;
-        config.format = toWGPU(desc.format);
-        config.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopyDst;
-        config.width = width;
-        config.height = height;
-        config.alphaMode = WGPUCompositeAlphaMode_Opaque;
-        config.presentMode = WGPUPresentMode_Fifo;
-        wgpuSurfaceConfigure(surface, &config);
 
         for (auto &texture : textures) {
             texture->releaseHandle();
@@ -1796,6 +1815,21 @@ namespace plume {
 
         if (isEmpty()) {
             return false;
+        }
+
+        if ((configuredWidth != width) || (configuredHeight != height)) {
+            plume_webgpu_size_canvas(selector.c_str(), width, height);
+            WGPUSurfaceConfiguration config = WGPU_SURFACE_CONFIGURATION_INIT;
+            config.device = commandQueue->device->device;
+            config.format = toWGPU(desc.format);
+            config.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopyDst;
+            config.width = width;
+            config.height = height;
+            config.alphaMode = WGPUCompositeAlphaMode_Opaque;
+            config.presentMode = WGPUPresentMode_Fifo;
+            wgpuSurfaceConfigure(surface, &config);
+            configuredWidth = width;
+            configuredHeight = height;
         }
 
         WGPUSurfaceTexture surfaceTexture = WGPU_SURFACE_TEXTURE_INIT;

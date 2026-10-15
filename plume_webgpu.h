@@ -370,6 +370,8 @@ namespace plume {
         uint32_t nextTextureIndex = 0;
         uint32_t width = 0;
         uint32_t height = 0;
+        uint32_t configuredWidth = 0;
+        uint32_t configuredHeight = 0;
         bool vsyncEnabled = true;
         WebGPUFrameTimer *frameTimer = nullptr;
         uint32_t uncappedRate = 0;
