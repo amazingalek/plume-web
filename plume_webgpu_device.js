@@ -18,7 +18,8 @@ Module['preRun'].push(() => {
       throw new Error('No WebGPU adapter.');
     }
 
-    const optionalFeatures = ['float32-filterable', 'float32-blendable', 'depth-clip-control', 'dual-source-blending', 'texture-compression-bc', 'timestamp-query'];
+    const optionalFeatures = ['float32-filterable', 'float32-blendable', 'depth-clip-control', 'dual-source-blending', 'texture-compression-bc', 'timestamp-query',
+      'depth32float-stencil8'];
     const requiredFeatures = optionalFeatures.filter((feature) => adapter.features.has(feature));
     const raisedLimits = ['maxSampledTexturesPerShaderStage', 'maxSamplersPerShaderStage', 'maxStorageBuffersPerShaderStage',
       'maxStorageTexturesPerShaderStage', 'maxBindingsPerBindGroup', 'maxStorageBufferBindingSize', 'maxBufferSize'];

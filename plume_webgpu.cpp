@@ -2619,13 +2619,14 @@ namespace plume {
     void WebGPUCommandList::copyTextureRegion(const RenderTextureCopyLocation &dstLocation, const RenderTextureCopyLocation &srcLocation, uint32_t dstX, uint32_t dstY, uint32_t dstZ, const RenderBox *srcBox) {
         endRenderPass();
 
-        auto textureInfo = [](const RenderTextureCopyLocation &location, uint32_t x, uint32_t y, uint32_t z) {
+        // A depth and stencil texture copies to or from a buffer one aspect at a time, and to another texture whole.
+        auto textureInfo = [](const RenderTextureCopyLocation &location, uint32_t x, uint32_t y, uint32_t z, bool withBuffer) {
             const WebGPUTexture *texture = static_cast<const WebGPUTexture *>(location.texture);
             WGPUTexelCopyTextureInfo info = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
             info.texture = texture->texture;
             info.mipLevel = location.subresource.mipLevel;
             info.origin = { x, y, (texture->desc.dimension == RenderTextureDimension::TEXTURE_3D) ? z : location.subresource.arrayIndex + z };
-            if (RenderFormatIsDepth(texture->desc.format) && RenderFormatIsStencil(texture->desc.format)) {
+            if (withBuffer && RenderFormatIsDepth(texture->desc.format) && RenderFormatIsStencil(texture->desc.format)) {
                 info.aspect = WGPUTextureAspect_DepthOnly;
             }
 
@@ -2669,18 +2670,18 @@ namespace plume {
 
         if (!srcIsTexture && dstIsTexture) {
             WGPUTexelCopyBufferInfo src = bufferInfo(srcLocation);
-            WGPUTexelCopyTextureInfo dst = textureInfo(dstLocation, dstX, dstY, dstZ);
+            WGPUTexelCopyTextureInfo dst = textureInfo(dstLocation, dstX, dstY, dstZ, true);
             wgpuCommandEncoderCopyBufferToTexture(encoder, &src, &dst, &extent);
         }
         else if (srcIsTexture && !dstIsTexture) {
-            WGPUTexelCopyTextureInfo src = textureInfo(srcLocation, srcX, srcY, srcZ);
+            WGPUTexelCopyTextureInfo src = textureInfo(srcLocation, srcX, srcY, srcZ, true);
             WGPUTexelCopyBufferInfo dst = bufferInfo(dstLocation);
             wgpuCommandEncoderCopyTextureToBuffer(encoder, &src, &dst, &extent);
             copiedInto(dstLocation.buffer);
         }
         else if (srcIsTexture && dstIsTexture) {
-            WGPUTexelCopyTextureInfo src = textureInfo(srcLocation, srcX, srcY, srcZ);
-            WGPUTexelCopyTextureInfo dst = textureInfo(dstLocation, dstX, dstY, dstZ);
+            WGPUTexelCopyTextureInfo src = textureInfo(srcLocation, srcX, srcY, srcZ, false);
+            WGPUTexelCopyTextureInfo dst = textureInfo(dstLocation, dstX, dstY, dstZ, false);
             wgpuCommandEncoderCopyTextureToTexture(encoder, &src, &dst, &extent);
         }
         else {
@@ -2861,6 +2862,7 @@ namespace plume {
         float32Filterable = wgpuDeviceHasFeature(device, WGPUFeatureName_Float32Filterable);
         float32Blendable = wgpuDeviceHasFeature(device, WGPUFeatureName_Float32Blendable);
         depthClipControl = wgpuDeviceHasFeature(device, WGPUFeatureName_DepthClipControl);
+        depth32FloatStencil8 = wgpuDeviceHasFeature(device, WGPUFeatureName_Depth32FloatStencil8);
         capabilities.dualSourceBlending = wgpuDeviceHasFeature(device, WGPUFeatureName_DualSourceBlending);
 
         WGPULimits limits = WGPU_LIMITS_INIT;
@@ -3196,7 +3198,12 @@ namespace plume {
     }
 
     RenderSampleCounts WebGPUDevice::getSampleCountsSupported(RenderFormat format) const {
-        // Core WebGPU guarantees 1 and 4 samples for every renderable format.
+        // Core WebGPU guarantees 1 and 4 samples for every renderable format. D32_FLOAT_S8_UINT is an optional feature,
+        // depth32float-stencil8, and a device without it has no such format.
+        if ((format == RenderFormat::D32_FLOAT_S8_UINT) && !depth32FloatStencil8) {
+            return 0;
+        }
+
         return RenderSampleCount::COUNT_1 | RenderSampleCount::COUNT_4;
     }
 

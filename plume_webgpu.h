@@ -616,6 +616,7 @@ namespace plume {
         bool float32Blendable = false;
         uint64_t pushConstantsChunkCount = 0;
         bool depthClipControl = false;
+        bool depth32FloatStencil8 = false;
         WGPUBindGroupLayout emptyLayout = nullptr;
         WGPUBindGroup emptyBindGroup = nullptr;
         WGPUBindGroupLayoutEntry pushConstantsEntry = {};
