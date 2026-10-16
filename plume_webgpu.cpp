@@ -1200,13 +1200,18 @@ namespace plume {
         this->desc.pixelShader = nullptr;
 
         // Start building it in the background for the layouts draws with its pipeline layout have resolved to, or
-        // once the first one has.
+        // once the first one has. Where the device builds in the background (Chrome), a pipeline created without
+        // buildInBackground is too, though it is ready at once: a draw that wants it before it is built builds it in
+        // line, and on Chrome's GPU main thread that held a page's presents for as long (RT64's ubershader, one
+        // pipeline per depth and coverage state, made at setup: ~1 s the first time a game drew with a third state,
+        // Ocarina of Time's title 25 s after its boot). Firefox builds those in line too, so it builds each when drawn.
         builds = std::make_shared<WebGPURenderPipelineBuilds>();
         builds->pipeline = this;
-        if (desc.buildInBackground && (desc.pipelineLayout != nullptr)) {
+        const bool background = desc.buildInBackground || device->capabilities.backgroundPipelineBuilds;
+        if (background && (desc.pipelineLayout != nullptr)) {
             const WebGPUPipelineLayout *pipelineLayout = static_cast<const WebGPUPipelineLayout *>(desc.pipelineLayout);
             if (pipelineLayout->resolvedLayouts.empty()) {
-                builds->waitingForLayout = true;
+                builds->waitingForLayout = desc.buildInBackground;
                 pipelineLayout->waitingBuilds.emplace_back(builds);
             }
 
@@ -1249,7 +1254,7 @@ namespace plume {
     }
 
     bool WebGPUGraphicsPipeline::isReady() {
-        return !builds->waitingForLayout && builds->pending.empty();
+        return !desc.buildInBackground || (!builds->waitingForLayout && builds->pending.empty());
     }
 
     WGPURenderPipeline WebGPUGraphicsPipeline::get(WGPUPipelineLayout layout) {
@@ -2040,7 +2045,12 @@ namespace plume {
                 std::shared_ptr<WebGPURenderPipelineBuilds> builds = waiting.lock();
                 if ((builds != nullptr) && (builds->pipeline != nullptr)) {
                     builds->waitingForLayout = false;
-                    builds->pipeline->build(pipelineLayout, true);
+
+                    // A pipeline that is ready at once and drawn with now is built in place by this draw (get()).
+                    const bool drawnNow = (builds->pipeline == pipeline) && !builds->pipeline->desc.buildInBackground;
+                    if (!drawnNow) {
+                        builds->pipeline->build(pipelineLayout, true);
+                    }
                 }
             }
 
