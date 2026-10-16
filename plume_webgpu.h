@@ -569,9 +569,9 @@ namespace plume {
         void setPassPipeline(WGPURenderPipeline renderPipeline);
         void clearRects(int32_t colorAttachment, const RenderColor &color, bool clearDepth, bool clearStencil, float depthValue, uint32_t stencilValue, const RenderRect *rects, uint32_t rectCount);
         void copiedInto(const RenderBuffer *buffer);
-        bool prepareDraw();
+        bool prepareDraw(bool drawsNothing);
         void setPushConstants(BindState &state, uint32_t rangeIndex, const void *data, uint32_t offset, uint32_t size);
-        WGPUPipelineLayout resolveBindings(BindState &state);
+        WGPUPipelineLayout resolveBindings(BindState &state, bool drawWith = true);
         void bindGroups(BindState &state, WGPURenderPassEncoder renderPass, WGPUComputePassEncoder computePass);
     };
 

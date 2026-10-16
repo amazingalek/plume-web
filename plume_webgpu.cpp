@@ -2029,7 +2029,8 @@ namespace plume {
     }
 
     // The bind group layouts of the bound descriptor sets, and the push constants in group 3, make the pipeline layout.
-    WGPUPipelineLayout WebGPUCommandList::resolveBindings(BindState &state) {
+    // Without drawWith nothing is drawn with the bound pipeline now (a draw of nothing), so it is built in the background too.
+    WGPUPipelineLayout WebGPUCommandList::resolveBindings(BindState &state, bool drawWith) {
         assert(state.layout != nullptr);
 
         // The same layout and sets as the last time, none of them changed since.
@@ -2084,7 +2085,7 @@ namespace plume {
                     builds->waitingForLayout = false;
 
                     // A pipeline that is ready at once and drawn with now is built in place by this draw (get()).
-                    const bool drawnNow = (builds->pipeline == pipeline) && !builds->pipeline->desc.buildInBackground;
+                    const bool drawnNow = drawWith && (builds->pipeline == pipeline) && !builds->pipeline->desc.buildInBackground;
                     if (!drawnNow) {
                         builds->pipeline->build(pipelineLayout, true);
                     }
@@ -2293,13 +2294,20 @@ namespace plume {
         return true;
     }
 
-    bool WebGPUCommandList::prepareDraw() {
+    bool WebGPUCommandList::prepareDraw(bool drawsNothing) {
         if (!beginRenderPass()) {
             return false;
         }
 
+        // A draw of nothing records nothing, but resolves the bindings as a draw would, which starts the pipelines waiting
+        // for that layout (WebGPUGraphicsPipeline) in the background, the bound one included: a renderer draws nothing with
+        // the sets it draws with to have its pipelines built before its first draw needs them.
         assert((pipeline != nullptr) && (pipeline->type == WebGPUPipeline::Type::Graphics));
-        WGPUPipelineLayout layout = resolveBindings(graphics);
+        WGPUPipelineLayout layout = resolveBindings(graphics, !drawsNothing);
+        if (drawsNothing) {
+            return false;
+        }
+
         const WebGPUGraphicsPipeline *graphicsPipeline = static_cast<const WebGPUGraphicsPipeline *>(pipeline);
         setPassPipeline(const_cast<WebGPUGraphicsPipeline *>(graphicsPipeline)->get(layout));
         if (graphicsPipeline->desc.stencilEnabled && (!pass.stencilReferenceSet || (pass.stencilReference != graphicsPipeline->desc.stencilReference))) {
@@ -2381,13 +2389,13 @@ namespace plume {
     }
 
     void WebGPUCommandList::drawInstanced(uint32_t vertexCountPerInstance, uint32_t instanceCount, uint32_t startVertexLocation, uint32_t startInstanceLocation) {
-        if (prepareDraw()) {
+        if (prepareDraw((vertexCountPerInstance == 0) || (instanceCount == 0))) {
             wgpuRenderPassEncoderDraw(renderPass, vertexCountPerInstance, instanceCount, startVertexLocation, startInstanceLocation);
         }
     }
 
     void WebGPUCommandList::drawIndexedInstanced(uint32_t indexCountPerInstance, uint32_t instanceCount, uint32_t startIndexLocation, int32_t baseVertexLocation, uint32_t startInstanceLocation) {
-        if (prepareDraw()) {
+        if (prepareDraw((indexCountPerInstance == 0) || (instanceCount == 0))) {
             wgpuRenderPassEncoderDrawIndexed(renderPass, indexCountPerInstance, instanceCount, startIndexLocation, baseVertexLocation, startInstanceLocation);
         }
     }
