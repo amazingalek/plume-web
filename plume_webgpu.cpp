@@ -1215,7 +1215,17 @@ namespace plume {
         // pipeline per depth and coverage state, made at setup: ~1 s the first time a game drew with a third state,
         // Ocarina of Time's title 25 s after its boot). Firefox builds those in line too, so it builds each when drawn.
         builds = std::make_shared<WebGPURenderPipelineBuilds>();
+        builds->device = device;
         builds->pipeline = this;
+
+        // What the browser compiles for each stage: the modules and the override constants.
+        auto appendKey = [&](const void *data, size_t size) { builds->shadersKey.append(static_cast<const char *>(data), size); };
+        appendKey(&vertexStage.module, sizeof(vertexStage.module));
+        appendKey(&pixelStage.module, sizeof(pixelStage.module));
+        for (const RenderSpecConstant &specConstant : specConstants) {
+            appendKey(&specConstant, sizeof(specConstant));
+        }
+
         const bool background = desc.buildInBackground || device->capabilities.backgroundPipelineBuilds;
         if (background && (desc.pipelineLayout != nullptr)) {
             const WebGPUPipelineLayout *pipelineLayout = static_cast<const WebGPUPipelineLayout *>(desc.pipelineLayout);
@@ -1248,6 +1258,28 @@ namespace plume {
             fprintf(stderr, "plume WebGPU: a pipeline built in the background failed: %.*s\n", int(message.length), message.data);
         }
 
+        // The builds that waited for this one's shaders: the browser has them compiled now.
+        if (status != WGPUCreatePipelineAsyncStatus_CallbackCancelled) {
+            auto &sharedShaderBuilds = builds->device->sharedShaderBuilds;
+            auto sharedIt = sharedShaderBuilds.find({ builds->shadersKey, layout });
+            if (sharedIt != sharedShaderBuilds.end()) {
+                auto deferred = std::move(sharedIt->second.deferred);
+                sharedShaderBuilds.erase(sharedIt);
+                for (const auto &waiting : deferred) {
+                    std::shared_ptr<WebGPURenderPipelineBuilds> waitingBuilds = waiting.first.lock();
+                    if (waitingBuilds == nullptr) {
+                        continue;
+                    }
+
+                    WebGPUGraphicsPipeline *waitingPipeline = waitingBuilds->pipeline;
+                    waitingBuilds->pending.erase(waiting.second);
+                    if ((waitingPipeline != nullptr) && (waitingPipeline->pipelines.find(waiting.second) == waitingPipeline->pipelines.end())) {
+                        waitingPipeline->build(waiting.second, true, false);
+                    }
+                }
+            }
+        }
+
         if (result == nullptr) {
             return;
         }
@@ -1275,7 +1307,21 @@ namespace plume {
         return build(layout, false);
     }
 
-    WGPURenderPipeline WebGPUGraphicsPipeline::build(WGPUPipelineLayout layout, bool async) {
+    WGPURenderPipeline WebGPUGraphicsPipeline::build(WGPUPipelineLayout layout, bool async, bool deferIfShared) {
+        // A build in the background whose shaders, constants and layout match one in flight waits for it, and starts once
+        // that one is built, when the browser has them compiled: Chrome compiles each pipeline's shaders on its own, so
+        // RT64's ubershader (one 240 KB pixel shader, a pipeline per depth and coverage state) built 8 times over at once.
+        if (async && deferIfShared) {
+            auto sharedIt = device->sharedShaderBuilds.find({ builds->shadersKey, layout });
+            if (sharedIt != device->sharedShaderBuilds.end()) {
+                builds->pending.insert(layout);
+                sharedIt->second.deferred.emplace_back(builds, layout);
+                return nullptr;
+            }
+
+            device->sharedShaderBuilds[{ builds->shadersKey, layout }];
+        }
+
         std::vector<std::string> keys;
         std::vector<WGPUConstantEntry> constants = toConstantEntries(specConstants, vertexStage, keys);
         std::vector<std::string> pixelKeys;

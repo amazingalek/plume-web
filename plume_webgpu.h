@@ -300,9 +300,16 @@ namespace plume {
 
     // A graphics pipeline's builds in flight, shared with their callbacks, which can run after it is gone.
     struct WebGPURenderPipelineBuilds {
+        WebGPUDevice *device = nullptr;
         WebGPUGraphicsPipeline *pipeline = nullptr;
         std::set<WGPUPipelineLayout> pending;
         bool waitingForLayout = false;
+        std::string shadersKey;
+    };
+
+    // Background builds that compile the same shaders for the same layout as one in flight, started once it is done.
+    struct WebGPUSharedShaderBuilds {
+        std::vector<std::pair<std::weak_ptr<WebGPURenderPipelineBuilds>, WGPUPipelineLayout>> deferred;
     };
 
     struct WebGPUGraphicsPipeline : WebGPUPipeline {
@@ -319,7 +326,7 @@ namespace plume {
         ~WebGPUGraphicsPipeline() override;
         bool isReady() override;
         WGPURenderPipeline get(WGPUPipelineLayout layout);
-        WGPURenderPipeline build(WGPUPipelineLayout layout, bool async);
+        WGPURenderPipeline build(WGPUPipelineLayout layout, bool async, bool deferIfShared = true);
     };
 
     struct WebGPUPipelineLayout : RenderPipelineLayout {
@@ -630,6 +637,7 @@ namespace plume {
         std::vector<WebGPUBuffer *> mappedBuffers;
         WGPUShaderModule clearShader = nullptr;
         std::unordered_map<std::string, WGPURenderPipeline> clearPipelines;
+        std::map<std::pair<std::string, WGPUPipelineLayout>, WebGPUSharedShaderBuilds> sharedShaderBuilds;
         double lastPollTime = 0.0;
 
         WebGPUDevice(WebGPUInterface *renderInterface);
