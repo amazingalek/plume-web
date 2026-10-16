@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <climits>
 
 #include "plume_render_interface_types.h"
@@ -102,6 +103,14 @@ namespace plume {
         // which learns that a present's work is done in a callback on the device's thread). A thread other than the
         // device's can wait for it to turn true.
         virtual bool isWaitReady() { return true; }
+
+        // Holds the calling thread until about the given time, and ends on a frame of the display where the backend
+        // learns of them as they come (WebGPU's animation frames): on the first one less than half a frame before that
+        // time, or at the time if none comes by then. False at once where it can't or a timed sleep ends on time, and
+        // the caller sleeps itself. Any thread but the device's may call it.
+#if defined(__EMSCRIPTEN__)
+        virtual bool sleepUntil(std::chrono::steady_clock::time_point time) { return false; }
+#endif
 
         virtual bool resize() = 0;
         virtual bool needsResize() const = 0;
@@ -263,6 +272,11 @@ namespace plume {
         virtual RenderSampleCounts getSampleCountsSupported(RenderFormat format) const = 0;
         virtual bool beginCapture() = 0;
         virtual bool endCapture() = 0;
+#if defined(__EMSCRIPTEN__)
+        // A backend that delivers a READBACK buffer's data asynchronously (WebGPU's) calls this back each time some
+        // arrives, on the thread it delivers it on, so a thread waiting for isMapReady() can be answered then.
+        virtual void setReadbackCallback(void (*callback)()) { }
+#endif
     };
 
     struct RenderInterface {

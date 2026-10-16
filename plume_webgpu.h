@@ -82,7 +82,9 @@
 //   reports the display's rate as <rate> (360) and keeps 4 in flight, to measure how many presents a second a page can
 //   make with the browser's own frames uncapped (the swap chain's constructor says how).
 // - The browser doesn't say what the display's refresh rate is, so a swap chain times the animation frames with a
-//   loop of its own on the device's thread, whatever its caller presents at, and reports displayTiming.
+//   loop of its own on the device's thread, whatever its caller presents at, and reports displayTiming. The loop wakes
+//   a thread in sleepUntil() at each frame, the one call another thread may make, where a timed sleep on a page's
+//   thread ends late (plume_web_waits.h).
 // - Every call must come from the thread that owns the device's JavaScript object: WebGPU objects can't be shared
 //   between workers.
 // - Shaders are WGSL text (RenderShaderFormat::WGSL). Specialization constants are WGSL overrides named by their id,
@@ -110,6 +112,7 @@
 
 #include "plume_render_interface.h"
 
+#include <atomic>
 #include <list>
 #include <map>
 #include <set>
@@ -351,6 +354,12 @@ namespace plume {
         uint32_t frameIntervalCursor = 0;
         uint32_t refreshRate = 60;
         uint32_t frameCount = 0;
+
+        // For sleepUntil() on other threads: the frames so far (a futex woken at each), when the last one came
+        // (emscripten_get_now()) and the display's frame in ms.
+        std::atomic<uint32_t> frameSerial = 0;
+        std::atomic<double> frameNow = 0.0;
+        std::atomic<double> frameMs = 1000.0 / 60.0;
     };
 
     // The presents whose work the GPU hasn't finished, and for present-stats how long each one's took to be reported
@@ -404,6 +413,7 @@ namespace plume {
         bool present(uint32_t textureIndex, RenderCommandSemaphore **waitSemaphores, uint32_t waitSemaphoreCount) override;
         void wait() override;
         bool isWaitReady() override;
+        bool sleepUntil(std::chrono::steady_clock::time_point time) override;
         bool resize() override;
         bool needsResize() const override;
         void setVsyncEnabled(bool vsyncEnabled) override;
@@ -647,6 +657,7 @@ namespace plume {
         RenderSampleCounts getSampleCountsSupported(RenderFormat format) const override;
         bool beginCapture() override;
         bool endCapture() override;
+        void setReadbackCallback(void (*callback)()) override;
         WGPUBindGroupLayout getBindGroupLayout(const std::string &key, const std::vector<WGPUBindGroupLayoutEntry> &entries);
         WGPUBindGroup getBindGroup(const std::string &key, WGPUBindGroupLayout layout, const std::vector<WGPUBindGroupEntry> &entries);
         WGPUPipelineLayout getPipelineLayout(const std::vector<WGPUBindGroupLayout> &layouts);

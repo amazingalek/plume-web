@@ -22,6 +22,7 @@
 
 #if defined(__EMSCRIPTEN_PTHREADS__)
 #include <emscripten/proxying.h>
+#include "plume_web_waits.h"
 #endif
 
 namespace plume {
@@ -146,7 +147,7 @@ namespace plume {
         // Each answer wakes a map() waiting for one.
         std::mutex answerMutex;
         std::condition_variable answerCondition;
-        uint64_t answerCount = 0;
+        std::atomic<uint64_t> answerCount = 0;
 
         bool isReady() const {
             return answer == ((executions << 1) | 1);
@@ -172,14 +173,25 @@ namespace plume {
             mapped = false;
         }
 
-        // Waits for an answer after the one counted, or a millisecond.
+        // Waits for an answer after the one counted, or a millisecond. Where a timed wait ends late (plume_web_waits.h),
+        // it spins out the millisecond instead: Firefox's GPU process calls a map back only after a submission, which is
+        // what each question makes (isMapReady()), so a waiter that slept between questions asked one every 15.6 ms and
+        // its data arrived a tick or two late.
         void waitForAnswer(uint64_t counted) {
+#if defined(__EMSCRIPTEN_PTHREADS__)
+            if (timedWaitsEndLate()) {
+                const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+                while ((answerCount == counted) && ((std::chrono::steady_clock::now() - start) < std::chrono::milliseconds(1))) {
+                }
+
+                return;
+            }
+#endif
             std::unique_lock lock(answerMutex);
             answerCondition.wait_for(lock, std::chrono::milliseconds(1), [&]() { return answerCount != counted; });
         }
 
         uint64_t countAnswers() {
-            std::lock_guard lock(answerMutex);
             return answerCount;
         }
     };
@@ -187,8 +199,18 @@ namespace plume {
     // On a device thread: the READBACK buffers whose data hasn't arrived since their last copy was replayed.
     static thread_local std::vector<std::shared_ptr<DTMapState>> pendingReadbacks;
 
+    static thread_local bool checkingReadbacks = false;
+
     static void checkPendingReadbacks() {
+        // The backend's readback callback can't come from inside a check (its callbacks come from its event loop), but if
+        // it did, the check in progress answers them all anyway.
+        if (checkingReadbacks) {
+            return;
+        }
+
+        checkingReadbacks = true;
         pendingReadbacks.erase(std::remove_if(pendingReadbacks.begin(), pendingReadbacks.end(), [](const std::shared_ptr<DTMapState> &state) { return state->check(); }), pendingReadbacks.end());
+        checkingReadbacks = false;
     }
 
     void DTMapState::ask(DeviceThread *thread) {
@@ -1090,6 +1112,13 @@ namespace plume {
             return runSync(thread, [&]() { return inner->isWaitReady(); });
         }
 
+#if defined(__EMSCRIPTEN__)
+        // On the calling thread: it waits there, for frames the backend learns of on the device thread.
+        bool sleepUntil(std::chrono::steady_clock::time_point time) override {
+            return inner->sleepUntil(time);
+        }
+#endif
+
         bool resize() override {
             return runSync(thread, [&]() {
                 const bool resized = inner->resize();
@@ -1287,6 +1316,14 @@ namespace plume {
         DTDevice(DeviceThread *thread, std::unique_ptr<RenderDevice> inner) : thread(thread), inner(inner.release()) {
             capabilities = this->inner->getCapabilities();
             description = this->inner->getDescription();
+#if defined(__EMSCRIPTEN__)
+            // A READBACK buffer's data arrives in the backend's event loop, after the replay or present that last checked
+            // it, so the device thread answers its waiters when it does. Otherwise they learned it only when they asked
+            // again, after a wait of a millisecond, which on a page in Firefox on Windows ends on the system timer's
+            // 15.6 ms tick (plume_web_waits.h): each frame copied to RAM waited a
+            // tick or two, and Conker's page, which copies several a frame, presented 25-29 a second on a laptop.
+            thread->runAsync([device = this->inner]() { device->setReadbackCallback(&checkPendingReadbacks); });
+#endif
         }
 
         ~DTDevice() override { destroyAsync(thread, inner); }

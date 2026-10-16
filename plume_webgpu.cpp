@@ -17,6 +17,9 @@
 
 #include <emscripten/emscripten.h>
 #include <emscripten/html5.h>
+#include <emscripten/threading.h>
+
+#include "plume_web_waits.h"
 
 // Whether the browser builds a pipeline made with createRenderPipelineAsync without holding up the device. Chrome builds
 // it on threads of its own. Firefox (157, Windows) builds it on its GPU process's WebGPU thread, in line with everything
@@ -493,6 +496,10 @@ namespace plume {
         }
     }
 
+    // Called once a READBACK buffer's data has arrived (setReadbackCallback). One for every device: the callbacks of a
+    // device's maps can come after it is gone.
+    static void (*readbackCallback)() = nullptr;
+
     static void readbackMapped(WGPUMapAsyncStatus status, WGPUStringView message, void *userdata1, void *userdata2) {
         std::shared_ptr<WebGPUReadback> *pointer = static_cast<std::shared_ptr<WebGPUReadback> *>(userdata1);
         std::shared_ptr<WebGPUReadback> readback = std::move(*pointer);
@@ -505,16 +512,18 @@ namespace plume {
 
         readback->pending = false;
         WebGPUBuffer *buffer = readback->buffer;
-        if ((status != WGPUMapAsyncStatus_Success) || (buffer == nullptr)) {
-            return;
+        if ((status == WGPUMapAsyncStatus_Success) && (buffer != nullptr)) {
+            const void *data = wgpuBufferGetConstMappedRange(buffer->buffer, 0, buffer->shadow.size());
+            if (data != nullptr) {
+                memcpy(buffer->shadow.data(), data, buffer->shadow.size());
+            }
+
+            wgpuBufferUnmap(buffer->buffer);
         }
 
-        const void *data = wgpuBufferGetConstMappedRange(buffer->buffer, 0, buffer->shadow.size());
-        if (data != nullptr) {
-            memcpy(buffer->shadow.data(), data, buffer->shadow.size());
+        if (readbackCallback != nullptr) {
+            readbackCallback();
         }
-
-        wgpuBufferUnmap(buffer->buffer);
     }
 
     // Called after a submission that copied into this buffer.
@@ -1484,10 +1493,14 @@ namespace plume {
             // Until a few frames have been timed, 60 is what they run at on most displays.
             if (timer->frameIntervals.size() >= 5) {
                 timer->refreshRate = displayRate(*timer);
+                timer->frameMs = 1000.0 / std::max(timer->refreshRate, 1U);
             }
         }
 
         timer->lastFrameTime = time;
+        timer->frameNow = emscripten_get_now();
+        timer->frameSerial++;
+        emscripten_futex_wake(&timer->frameSerial, INT_MAX);
         return true;
     }
 
@@ -1624,6 +1637,30 @@ namespace plume {
         }
 
         return true;
+    }
+
+    // Where a timed wait on a page's thread ends late (plume_web_waits.h: Firefox on Windows, on the system timer's 15.6
+    // ms tick), RT64's sleeps of 100 us until each present's time took a tick each, and a present was late by up to a
+    // tick. A wake through the futex comes at once, so there this waits for the animation frames, the display's own
+    // timing, and on a timer only until the time itself, for a page whose frames have stopped (hidden). Elsewhere it
+    // returns false and the caller sleeps as before: in Chrome on a laptop's Intel graphics, presents on the animation
+    // frames made the GPU busier and the gaps between frames longer than RT64's own sleeps.
+    bool WebGPUSwapChain::sleepUntil(std::chrono::steady_clock::time_point time) {
+        if (emscripten_is_main_browser_thread() || !timedWaitsEndLate()) {
+            return false;
+        }
+
+        const double endMs = emscripten_get_now() + std::chrono::duration<double, std::milli>(time - std::chrono::steady_clock::now()).count();
+        const double fromMs = endMs - frameTimer->frameMs / 2.0;
+        for (;;) {
+            const uint32_t serial = frameTimer->frameSerial;
+            const double now = emscripten_get_now();
+            if ((now >= endMs) || (frameTimer->frameNow >= fromMs)) {
+                return true;
+            }
+
+            emscripten_futex_wait(&frameTimer->frameSerial, serial, endMs - now);
+        }
     }
 
     void WebGPUSwapChain::wait() {
@@ -3169,6 +3206,10 @@ namespace plume {
 
     bool WebGPUDevice::endCapture() {
         return false;
+    }
+
+    void WebGPUDevice::setReadbackCallback(void (*callback)()) {
+        readbackCallback = callback;
     }
 
     // WebGPUInterface
