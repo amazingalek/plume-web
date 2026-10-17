@@ -1646,6 +1646,12 @@ namespace plume {
         delete work;
     }
 
+    static void setupWorkDone(WGPUQueueWorkDoneStatus status, WGPUStringView message, void *userdata1, void *userdata2) {
+        std::shared_ptr<WebGPUPresentState> *state = static_cast<std::shared_ptr<WebGPUPresentState> *>(userdata1);
+        (*state)->caughtUp = true;
+        delete state;
+    }
+
     // The browser shows the canvas when this thread returns to its event loop, so when the build can wait, this does
     // that until the next animation frame (or just once without vsync).
     bool WebGPUSwapChain::present(uint32_t textureIndex, RenderCommandSemaphore **waitSemaphores, uint32_t waitSemaphoreCount) {
@@ -1720,6 +1726,22 @@ namespace plume {
     }
 
     bool WebGPUSwapChain::isWaitReady() {
+        // The first present waits until the GPU process has done everything the device was asked for before it
+        // (plume_webgpu.h), and isn't counted as a wait of the presents in flight.
+        if (!presentState->caughtUp) {
+            if (!caughtUpAsked) {
+                caughtUpAsked = true;
+                WGPUQueueWorkDoneCallbackInfo callbackInfo = WGPU_QUEUE_WORK_DONE_CALLBACK_INFO_INIT;
+                callbackInfo.mode = WGPUCallbackMode_AllowSpontaneous;
+                callbackInfo.callback = setupWorkDone;
+                callbackInfo.userdata1 = new std::shared_ptr<WebGPUPresentState>(presentState);
+                wgpuQueueOnSubmittedWorkDone(commandQueue->device->queue, callbackInfo);
+            }
+
+            commandQueue->device->pollQueue();
+            return false;
+        }
+
         if (presentState->inFlight < maxPresentsInFlight) {
             if (waitStartTime > 0.0) {
                 const double waitedMs = emscripten_get_now() - waitStartTime;

@@ -81,6 +81,13 @@
 //   at hand, that says whether the GPU, the callbacks or the browser's frames hold presents back. uncapped=<rate>
 //   reports the display's rate as <rate> (360) and keeps 4 in flight, to measure how many presents a second a page can
 //   make with the browser's own frames uncapped (the swap chain's constructor says how).
+// - With presentWait, the first present waits until the GPU process has done everything the device was asked for
+//   before it (onSubmittedWorkDone). A caller's setup creates its shader modules and pipelines all at once, and the
+//   browser does much of that in line, on the GPU process's thread every present queues behind (Chrome parses a
+//   module with Tint there, and builds a pipeline created without createRenderPipelineAsync there): presented before
+//   it was done, the first frames shown were followed by none for as long. RT64's setup held GoldenEye's launcher
+//   ~0.45 s after its first frames that way in Chrome 155 (RTX 2070): two modules of ~250 KB of WGSL, 150 ms each, a
+//   compute pipeline built at its first dispatch and render pipelines built at their first draw.
 // - The browser doesn't say what the display's refresh rate is, so a swap chain times the animation frames with a
 //   loop of its own on the device's thread, whatever its caller presents at, and reports displayTiming. The loop wakes
 //   a thread in sleepUntil() at each frame, the one call another thread may make, where a timed sleep on a page's
@@ -373,6 +380,7 @@ namespace plume {
     // done. Shared with their callbacks, which can outlive the swap chain.
     struct WebGPUPresentState {
         uint32_t inFlight = 0;
+        bool caughtUp = false;
         bool timeWorkDone = false;
         std::vector<double> workDoneMs;
     };
@@ -395,6 +403,7 @@ namespace plume {
         std::shared_ptr<WebGPUPresentState> presentState = std::make_shared<WebGPUPresentState>();
         uint32_t maxPresentsInFlight = 2;
         double waitStartTime = 0.0;
+        bool caughtUpAsked = false;
 
         // The number in flight tried one higher while wait() holds presents, and kept only if presents rise with it.
         bool presentsInFlightFixed = false;
