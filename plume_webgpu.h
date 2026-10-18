@@ -65,8 +65,9 @@
 //   takes 60 frames a second whatever the GPU finishes, so its queue grew seconds deep and the page showed a frame or
 //   two a second. So a swap chain counts the presents whose work the GPU hasn't finished (onSubmittedWorkDone), and
 //   with presentWait, wait() holds the next present until fewer than the swap chain's maxFrameLatency (at least 2)
-//   are, and isWaitReady() says whether it would. Behind plume_device_thread.h the calling thread polls isWaitReady(),
-//   as it does isMapReady(); without threads, wait() waits when the build can. Not 1: Firefox calls back late, and with
+//   are, and isWaitReady() says whether it would. Behind plume_device_thread.h the calling thread waits for that itself
+//   (waitOnCaller(), a futex the done callbacks wake), polling isWaitReady() only for the first present; without
+//   threads, wait() waits when the build can. Not 1: Firefox calls back late, and with
 //   one frame in flight a GPU that could finish ~54 frames a second gave 38, against 46 with two and 47 with three
 //   (whose queue sat 50 ms behind against 33). Nor always 2: where the callback comes back later than two frames, two
 //   in flight hold presents below the display's rate with the GPU idle, and RT64 reads the presents it skips as the GPU
@@ -91,8 +92,8 @@
 //   compute pipeline built at its first dispatch and render pipelines built at their first draw.
 // - The browser doesn't say what the display's refresh rate is, so a swap chain times the animation frames with a
 //   loop of its own on the device's thread, whatever its caller presents at, and reports displayTiming. The loop wakes
-//   a thread in sleepUntil() at each frame, the one call another thread may make, where a timed sleep on a page's
-//   thread ends late (plume_web_waits.h).
+//   a thread in sleepUntil() at each frame, where a timed sleep on a page's thread ends late (plume_web_waits.h).
+//   sleepUntil() and waitOnCaller() are the calls another thread may make.
 // - Every call must come from the thread that owns the device's JavaScript object: WebGPU objects can't be shared
 //   between workers.
 // - Shaders are WGSL text (RenderShaderFormat::WGSL). Specialization constants are WGSL overrides named by their id,
@@ -377,11 +378,13 @@ namespace plume {
         std::atomic<double> frameMs = 1000.0 / 60.0;
     };
 
-    // The presents whose work the GPU hasn't finished, and for present-stats how long each one's took to be reported
-    // done. Shared with their callbacks, which can outlive the swap chain.
+    // The presents whose work the GPU hasn't finished (a futex, woken as each is done), and for present-stats how long
+    // each one's took to be reported done. Shared with their callbacks, which can outlive the swap chain. inFlight,
+    // caughtUp and waitedMs (the time waitOnCaller() held presents, not yet counted) are read on other threads too.
     struct WebGPUPresentState {
-        uint32_t inFlight = 0;
-        bool caughtUp = false;
+        std::atomic<uint32_t> inFlight = 0;
+        std::atomic<bool> caughtUp = false;
+        std::atomic<double> waitedMs = 0.0;
         bool timeWorkDone = false;
         std::vector<double> workDoneMs;
     };
@@ -402,7 +405,7 @@ namespace plume {
         uint32_t uncappedRate = 0;
 
         std::shared_ptr<WebGPUPresentState> presentState = std::make_shared<WebGPUPresentState>();
-        uint32_t maxPresentsInFlight = 2;
+        std::atomic<uint32_t> maxPresentsInFlight = 2;
         double waitStartTime = 0.0;
         bool caughtUpAsked = false;
         int kickTimer = 0;
@@ -432,6 +435,7 @@ namespace plume {
         void wait() override;
         bool isWaitReady() override;
         bool sleepUntil(std::chrono::steady_clock::time_point time) override;
+        bool waitOnCaller(const std::atomic<uint32_t> &queued) override;
         bool resize() override;
         bool needsResize() const override;
         void setVsyncEnabled(bool vsyncEnabled) override;

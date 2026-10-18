@@ -991,6 +991,10 @@ namespace plume {
         mutable std::atomic<uint32_t> innerRefreshRate = 0;
         mutable std::atomic<bool> refreshing = false;
 
+        // The presents queued for the device thread that haven't reached the backend's present() yet, which waitOnCaller()
+        // counts as in flight.
+        std::atomic<uint32_t> presentsQueued = 0;
+
         // On the device thread.
         DTSwapChain(DeviceThread *thread, RenderDevice *innerDevice, RenderCommandQueue *innerQueue, std::unique_ptr<RenderSwapChain> inner, const RenderSwapChainDesc &desc)
             : thread(thread), innerDevice(innerDevice), innerQueue(innerQueue), inner(inner.release()), desc(desc)
@@ -1060,11 +1064,13 @@ namespace plume {
         bool present(uint32_t textureIndex, RenderCommandSemaphore **waitSemaphores, uint32_t waitSemaphoreCount) override {
             assert(textureIndex < textures.size());
             std::vector<RenderCommandSemaphore *> waits = unwrap(waitSemaphores, waitSemaphoreCount);
+            presentsQueued++;
             thread->runAsync([this, textureIndex, waits]() mutable {
                 publish();
                 RenderTexture *source = innerTextures[textureIndex].get();
                 uint32_t innerIndex = 0;
                 if ((source == nullptr) || !inner->acquireTexture(acquireSemaphore.get(), &innerIndex)) {
+                    presentsQueued--;
                     return;
                 }
 
@@ -1080,15 +1086,24 @@ namespace plume {
                 const RenderCommandList *commandList = copyList.get();
                 innerQueue->executeCommandLists(&commandList, 1, waits.data(), uint32_t(waits.size()), &signal, 1);
                 inner->present(innerIndex, &signal, 1);
+                presentsQueued--;
                 checkPendingReadbacks();
             });
 
             return true;
         }
 
-        // The backend learns that a present's work is done in a callback on the device thread (WebGPU's), so this thread
-        // polls isWaitReady() between calls rather than holding the device thread, as map() does isMapReady().
+        // The backend learns that a present's work is done in a callback on the device thread (WebGPU's), so where it can
+        // this thread waits for that itself (waitOnCaller()), with no trip to the device thread. Each trip queued behind
+        // whatever that thread was doing, a page's thread in Firefox's rendering, and the 1 ms sleep between two ended 6-14
+        // ms late in Firefox on a laptop: wait() took 33-38 ms a game frame there, and RT64 paced Banjo-Kazooie's 60 to 30.
+        // Otherwise (the first present, which asks the device thread) it polls isWaitReady() between calls rather than
+        // holding the device thread, as map() does isMapReady().
         void wait() override {
+            if (inner->waitOnCaller(presentsQueued)) {
+                return;
+            }
+
             const std::thread::id caller = std::this_thread::get_id();
             for (;;) {
                 const bool ready = runSync(thread, [&]() {

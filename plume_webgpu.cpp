@@ -1614,13 +1614,13 @@ namespace plume {
                 presentsInFlightFixed = true;
             }
 
-            printf("plume: uncapped, the display reported as %u Hz, at most %u presents in flight\n", uncappedRate, maxPresentsInFlight);
+            printf("plume: uncapped, the display reported as %u Hz, at most %u presents in flight\n", uncappedRate, maxPresentsInFlight.load());
         }
 
         presentStats = (plume_webgpu_query_number("present-stats") >= 0);
         presentState->timeWorkDone = presentStats;
         if (presentStats || (presentsInFlightQuery >= 0)) {
-            printf("plume: at most %u presents in flight\n", maxPresentsInFlight);
+            printf("plume: at most %u presents in flight\n", maxPresentsInFlight.load());
         }
     }
 
@@ -1650,6 +1650,7 @@ namespace plume {
     static void presentWorkDone(WGPUQueueWorkDoneStatus status, WGPUStringView message, void *userdata1, void *userdata2) {
         WebGPUPresentWork *work = static_cast<WebGPUPresentWork *>(userdata1);
         work->state->inFlight--;
+        emscripten_futex_wake(&work->state->inFlight, INT_MAX);
         if (work->state->timeWorkDone) {
             work->state->workDoneMs.emplace_back(emscripten_get_now() - work->presentTime);
         }
@@ -1694,6 +1695,9 @@ namespace plume {
             kickTimer = emscripten_set_timeout(kickWorkDone, 1.0, this);
         }
 
+        const double waitedMs = presentState->waitedMs.exchange(0.0);
+        statsWaitMs += waitedMs;
+        capWaitMs += waitedMs;
         if (presentStats) {
             statsPresents++;
             reportPresentStats();
@@ -1744,6 +1748,41 @@ namespace plume {
 
             emscripten_futex_wait(&frameTimer->frameSerial, serial, endMs - now);
         }
+    }
+
+    // On a thread other than the page's, once the first present is caught up (isWaitReady() asks the device's thread for
+    // that): presents leave flight in their done callbacks, which wake this, so it needs nothing of the device's thread.
+    // A present the caller has queued for that thread is counted in `queued` until present() counts it in inFlight, so
+    // it is never in neither. The wait ends after 100 ms all the same, for what changes without a wake (a queued present
+    // that never reaches present()).
+    bool WebGPUSwapChain::waitOnCaller(const std::atomic<uint32_t> &queued) {
+        if (emscripten_is_main_browser_thread() || !presentState->caughtUp) {
+            return false;
+        }
+
+        double startMs = 0.0;
+        for (;;) {
+            const uint32_t queuedNow = queued;
+            const uint32_t inFlight = presentState->inFlight;
+            if ((queuedNow + inFlight) < maxPresentsInFlight) {
+                break;
+            }
+
+            if (startMs == 0.0) {
+                startMs = emscripten_get_now();
+            }
+
+            emscripten_futex_wait(&presentState->inFlight, inFlight, 100.0);
+        }
+
+        if (startMs > 0.0) {
+            const double waitedMs = emscripten_get_now() - startMs;
+            double counted = presentState->waitedMs;
+            while (!presentState->waitedMs.compare_exchange_weak(counted, counted + waitedMs)) {
+            }
+        }
+
+        return true;
     }
 
     void WebGPUSwapChain::wait() {
@@ -1830,7 +1869,7 @@ namespace plume {
             capTrying = false;
             if ((rate >= (capTryRate * 1.08)) || (rate >= (displayRate * 0.95))) {
                 capRetryMs = 10000.0;
-                printf("plume: %u presents in flight (%.1f a second, from %.1f)\n", maxPresentsInFlight, rate, capTryRate);
+                printf("plume: %u presents in flight (%.1f a second, from %.1f)\n", maxPresentsInFlight.load(), rate, capTryRate);
             }
             else {
                 if (presentStats) {
@@ -1853,6 +1892,7 @@ namespace plume {
             capTryRate = rate;
             capTrying = true;
             maxPresentsInFlight++;
+            emscripten_futex_wake(&presentState->inFlight, INT_MAX);
         }
 
         capWindowStart = now;
@@ -1886,7 +1926,7 @@ namespace plume {
 
         printf("plume: %.1f presents a second, each done on the GPU %.0f ms after it (median; %.0f at p90, %.0f at most), "
             "%.0f ms a second waiting for fewer than %u in flight, %.1f animation frames a second (display read as %u Hz)\n",
-            statsPresents / seconds, quantile(0.5), quantile(0.9), quantile(1.0), statsWaitMs / seconds, maxPresentsInFlight,
+            statsPresents / seconds, quantile(0.5), quantile(0.9), quantile(1.0), statsWaitMs / seconds, maxPresentsInFlight.load(),
             (frameTimer->frameCount - statsFrameCount) / seconds, frameTimer->refreshRate);
 
         statsStartTime = now;

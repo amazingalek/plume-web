@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <climits>
 
@@ -111,6 +112,12 @@ namespace plume {
 #if defined(__EMSCRIPTEN__)
         virtual bool sleepUntil(std::chrono::steady_clock::time_point time) { return false; }
 #endif
+
+        // wait() on a thread other than the device's, counting as in flight the presents its caller has queued for the
+        // device's thread that haven't reached present() yet (`queued`). False at once where only the device's thread can
+        // tell (every backend but WebGPU), and the caller waits through it. Not behind __EMSCRIPTEN__ so that
+        // plume_device_thread.cpp's native test reaches it.
+        virtual bool waitOnCaller(const std::atomic<uint32_t> &queued) { return false; }
 
         virtual bool resize() = 0;
         virtual bool needsResize() const = 0;
