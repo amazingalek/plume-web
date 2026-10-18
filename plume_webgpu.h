@@ -38,8 +38,8 @@
 //   Without threads, map() waits for it itself when the build can (ASYNCIFY or JSPI: emscripten_sleep() hands the
 //   thread back to its event loop). Either way execute, wait, map reads what the GPU wrote, as on the other backends.
 //   A build that can't wait gets whatever arrived before the call, possibly a submission old. Firefox looks for
-//   finished work only after a submission or every 100 ms, so while a map (or a present, below) waits, an empty
-//   submission at most once a millisecond makes it look again (WebGPUDevice::pollQueue()).
+//   finished work only after a submission or every 100 ms, so while a map waits, or a present is in flight (below), an
+//   empty submission at most once a millisecond makes it look again (WebGPUDevice::pollQueue()).
 // - Formatted buffer views (texel buffers) don't exist. A formatted view binds its buffer as a read-only storage
 //   buffer of raw bytes, the binding padded to a multiple of 4, so the shader reads array<u32> and unpacks R8 or R16
 //   elements itself: element i of an n-byte format is at byte i * n, little-endian. A writable formatted view of
@@ -72,7 +72,8 @@
 //   in flight hold presents below the display's rate with the GPU idle, and RT64 reads the presents it skips as the GPU
 //   falling behind and paces them to the game's frames. With each callback held 20-40 ms (an RTX 2070's Firefox gives
 //   11-16 ms; a laptop's Intel graphics is suspected of more), Firefox 158 drew Banjo-Kazooie at 20 a second with 2 in
-//   flight, 58 with 3 and 59 with 4. The callbacks alone can't tell a late callback from a slow GPU, but only the first
+//   flight, 58 with 3 and 59 with 4 (before present() kicked Firefox to look for finished work while a present is in
+//   flight, which brings a laptop's callback back in ~5 ms rather than at the next frame). The callbacks alone can't tell a late callback from a slow GPU, but only the first
 //   gains from one more in flight, so while wait() holds presents a swap chain tries one more, up to 4, and keeps it if
 //   presents rise (adaptPresentsInFlight()), but only from presents steady before the try: after a stall any recovery is
 //   a rise. The page's query can fix the number (presents-in-flight=<1-8>), and
@@ -404,6 +405,7 @@ namespace plume {
         uint32_t maxPresentsInFlight = 2;
         double waitStartTime = 0.0;
         bool caughtUpAsked = false;
+        int kickTimer = 0;
 
         // The number in flight tried one higher while wait() holds presents, and kept only if presents rise with it.
         bool presentsInFlightFixed = false;
@@ -648,6 +650,7 @@ namespace plume {
         std::unordered_map<std::string, WGPURenderPipeline> clearPipelines;
         std::map<std::pair<std::string, WGPUPipelineLayout>, WebGPUSharedShaderBuilds> sharedShaderBuilds;
         double lastPollTime = 0.0;
+        bool workDoneAfterSubmit = false;
 
         WebGPUDevice(WebGPUInterface *renderInterface);
         ~WebGPUDevice() override;

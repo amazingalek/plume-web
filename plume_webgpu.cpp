@@ -16,6 +16,7 @@
 #include <cstring>
 
 #include <emscripten/emscripten.h>
+#include <emscripten/eventloop.h>
 #include <emscripten/html5.h>
 #include <emscripten/threading.h>
 
@@ -31,6 +32,12 @@ EM_JS(int, plume_webgpu_background_pipeline_builds, (), {
     }
     console.log('plume: pipelines are built in line with the device here (Firefox)');
     return 0;
+});
+
+// Whether the browser calls onSubmittedWorkDone and mapAsync back only when it next looks for finished work, after a
+// submission or on a timer (WebGPUDevice::pollQueue()). Chrome calls back when the work is done.
+EM_JS(int, plume_webgpu_work_done_after_submit, (), {
+    return navigator.userAgent.includes('Firefox') ? 1 : 0;
 });
 
 // Whether the browser's preferred canvas format is bgra8unorm (rgba8unorm otherwise): the one it presents a canvas in
@@ -1618,6 +1625,10 @@ namespace plume {
     }
 
     WebGPUSwapChain::~WebGPUSwapChain() {
+        if (kickTimer != 0) {
+            emscripten_clear_timeout(kickTimer);
+        }
+
         frameTimer->stopped = true;
         textures.clear();
         if (surface != nullptr) {
@@ -1652,6 +1663,23 @@ namespace plume {
         delete state;
     }
 
+    // Where the browser calls back only when it next looks for finished work (Firefox), a present's onSubmittedWorkDone
+    // came back at the next frame's submission, about a frame late, and nothing polled while presents stayed under the
+    // cap. That read as GPU time in present-stats' done delay and in adaptPresentsInFlight(), which raised the cap for
+    // it. So while any present is in flight, an empty submission 1 ms after it and then on a timer makes the browser look
+    // again (pollQueue(), at most once a millisecond): a test page's callback on a laptop's Intel UHD came back in 49.9
+    // ms alone, 2 ms with one empty submission 1 ms after its pass, and a frame's in 5 ms at 60 frames a second, against
+    // 18.5; Rush 2049's page's done delay fell from 16 to 4 ms. Firefox nests the timer down to 4 ms, so it costs ~150
+    // empty submissions a second, and none once presents are done.
+    static void kickWorkDone(void *userData) {
+        WebGPUSwapChain *swapChain = static_cast<WebGPUSwapChain *>(userData);
+        swapChain->kickTimer = 0;
+        if (swapChain->presentState->inFlight > 0) {
+            swapChain->commandQueue->device->pollQueue();
+            swapChain->kickTimer = emscripten_set_timeout(kickWorkDone, 2.0, swapChain);
+        }
+    }
+
     // The browser shows the canvas when this thread returns to its event loop, so when the build can wait, this does
     // that until the next animation frame (or just once without vsync).
     bool WebGPUSwapChain::present(uint32_t textureIndex, RenderCommandSemaphore **waitSemaphores, uint32_t waitSemaphoreCount) {
@@ -1662,6 +1690,9 @@ namespace plume {
         callbackInfo.callback = presentWorkDone;
         callbackInfo.userdata1 = new WebGPUPresentWork{ presentState, emscripten_get_now() };
         wgpuQueueOnSubmittedWorkDone(commandQueue->device->queue, callbackInfo);
+        if (commandQueue->device->workDoneAfterSubmit && (kickTimer == 0)) {
+            kickTimer = emscripten_set_timeout(kickWorkDone, 1.0, this);
+        }
 
         if (presentStats) {
             statsPresents++;
@@ -2964,6 +2995,7 @@ namespace plume {
         capabilities.backgroundPipelineBuilds = (plume_webgpu_background_pipeline_builds() != 0);
         capabilities.preferredSwapChainFormat = (plume_webgpu_bgra_swap_chain() != 0) ? RenderFormat::B8G8R8A8_UNORM : RenderFormat::R8G8B8A8_UNORM;
         description.name = "WebGPU";
+        workDoneAfterSubmit = (plume_webgpu_work_done_after_submit() != 0);
     }
 
     WebGPUDevice::~WebGPUDevice() {
@@ -3061,8 +3093,8 @@ namespace plume {
     // Firefox's GPU process looks for finished GPU work, and calls mapAsync and onSubmittedWorkDone back, only after a
     // submission or on a timer every 100 ms (POLL_TIME_MS in its WebGPUParent.cpp). A page that waits for one of those
     // callbacks before it submits more, as a readback does, so waits for the timer whenever the GPU hadn't finished by
-    // the submission's own look, which on a slow GPU is every time. While something waits, an empty submission at most
-    // once a millisecond makes it look again.
+    // the submission's own look, which on a slow GPU is every time. While something waits, or a present is in flight
+    // (kickWorkDone()), an empty submission at most once a millisecond makes it look again.
     void WebGPUDevice::pollQueue() {
         const double now = emscripten_get_now();
         if ((now - lastPollTime) >= 1.0) {
