@@ -2,9 +2,10 @@
 // main() runs and hands the device over as Module.preinitializedWebGPUDevice, which emscripten_webgpu_get_device()
 // returns. Optional features plume can use are asked for when the adapter has them, and the adapter's own maximum for
 // the limits a renderer with big descriptor sets and buffers runs into first (WebGPU's defaults are far below what
-// desktop GPUs offer). Validation errors and a lost device are logged to the console. The adapter's info (vendor,
-// architecture) is kept as Module.plumeWebGPUAdapterInfo. At the end, setBindGroup is made to work in Firefox with a
-// heap past 2 GB.
+// desktop GPUs offer), and for the largest texture, which a renderer scaling its targets to the screen runs into (8192
+// by default, where D3D12 and most adapters allow 16384). Validation errors and a lost device are logged to the
+// console. The adapter's info (vendor, architecture) is kept as Module.plumeWebGPUAdapterInfo. At the end,
+// setBindGroup is made to work in Firefox with a heap past 2 GB.
 Module['preRun'] = [].concat(Module['preRun'] || []);
 Module['preRun'].push(() => {
   addRunDependency('plume-webgpu-device');
@@ -22,7 +23,8 @@ Module['preRun'].push(() => {
       'depth32float-stencil8'];
     const requiredFeatures = optionalFeatures.filter((feature) => adapter.features.has(feature));
     const raisedLimits = ['maxSampledTexturesPerShaderStage', 'maxSamplersPerShaderStage', 'maxStorageBuffersPerShaderStage',
-      'maxStorageTexturesPerShaderStage', 'maxBindingsPerBindGroup', 'maxStorageBufferBindingSize', 'maxBufferSize'];
+      'maxStorageTexturesPerShaderStage', 'maxBindingsPerBindGroup', 'maxStorageBufferBindingSize', 'maxBufferSize',
+      'maxTextureDimension2D'];
     const requiredLimits = {};
     for (const limit of raisedLimits) {
       if (adapter.limits[limit] !== undefined) {
