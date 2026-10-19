@@ -645,6 +645,11 @@ namespace plume {
     }
 
     void WebGPUTexture::releaseHandle() {
+        if (storageView != nullptr) {
+            wgpuTextureViewRelease(storageView);
+            storageView = nullptr;
+        }
+
         if (defaultView != nullptr) {
             wgpuTextureViewRelease(defaultView);
             defaultView = nullptr;
@@ -672,6 +677,24 @@ namespace plume {
         }
 
         return defaultView;
+    }
+
+    // The view a storage slot binds for a texture set without one. WebGPU binds one mip level to a storage texture, so
+    // this is the first, as D3D12's null UAV desc is: the default view of a texture with mipmaps would fail the bind
+    // group, its pass and the whole submit.
+    WGPUTextureView WebGPUTexture::getStorageView() {
+        if (desc.mipLevels <= 1) {
+            return getDefaultView();
+        }
+
+        if ((storageView == nullptr) && (texture != nullptr)) {
+            WGPUTextureViewDescriptor viewDesc = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+            viewDesc.dimension = viewDimension(desc, nullptr);
+            viewDesc.mipLevelCount = 1;
+            storageView = wgpuTextureCreateView(texture, &viewDesc);
+        }
+
+        return storageView;
     }
 
     std::unique_ptr<RenderTextureView> WebGPUTexture::createTextureView(const RenderTextureViewDesc &desc) const {
@@ -1017,7 +1040,13 @@ namespace plume {
                     appendKey(key, 't', uint32_t(binding.binding), int32_t(layoutEntry.texture.sampleType), int32_t(dimension), int32_t(multisampled));
                 }
 
-                groupEntry.textureView = (binding.textureView != nullptr) ? binding.textureView->view : const_cast<WebGPUTexture *>(binding.texture)->getDefaultView();
+                WebGPUTexture *texture = const_cast<WebGPUTexture *>(binding.texture);
+                if (binding.textureView != nullptr) {
+                    groupEntry.textureView = binding.textureView->view;
+                }
+                else {
+                    groupEntry.textureView = (binding.type == RenderDescriptorRangeType::READ_WRITE_TEXTURE) ? texture->getStorageView() : texture->getDefaultView();
+                }
                 break;
             }
             case RenderDescriptorRangeType::SAMPLER: {
@@ -1047,7 +1076,8 @@ namespace plume {
 
             appendKey(key, 'v', uint64_t(layoutEntry.visibility));
 
-            // What the entry binds, for the device's bind group cache: a texture without a view binds its default one.
+            // What the entry binds, for the device's bind group cache: a texture without a view binds its default one, or
+            // on a storage slot its storage view (the layout's key tells the two apart).
             uint64_t serial = 0;
             if (groupEntry.buffer != nullptr) serial = binding.buffer->handleSerial;
             else if (groupEntry.sampler != nullptr) serial = binding.sampler->handleSerial;

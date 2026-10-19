@@ -186,6 +186,7 @@ namespace plume {
     struct WebGPUTexture : RenderTexture {
         WGPUTexture texture = nullptr;
         WGPUTextureView defaultView = nullptr;
+        WGPUTextureView storageView = nullptr;
         uint64_t handleSerial = 0;
         WebGPUDevice *device = nullptr;
         RenderTextureDesc desc;
@@ -197,6 +198,7 @@ namespace plume {
         std::unique_ptr<RenderTextureView> createTextureView(const RenderTextureViewDesc &desc) const override;
         void setName(const std::string &name) override;
         WGPUTextureView getDefaultView();
+        WGPUTextureView getStorageView();
         void releaseHandle();
     };
 
