@@ -36,7 +36,7 @@
 //   tasks of its event loop whenever it updates the rendering, so a canvas texture acquired in one task can be gone
 //   by the next. That costs a copy of the window each present. wait() waits on the calling thread where the backend
 //   can tell it there (waitOnCaller()), and otherwise polls the backend's isWaitReady() from it, as map() does
-//   isMapReady(). needsResize() and getRefreshRate() don't wait for the device thread:
+//   isMapReady(). needsResize(), getRefreshRate() and isHidden() don't wait for the device thread:
 //   they answer what the backend said at the last present, resize() or refresh, and queue a refresh.
 // - On the device thread itself, everything runs in place, after whatever is queued.
 // - Raytracing and acceleration structures aren't forwarded: WebGPU has neither.

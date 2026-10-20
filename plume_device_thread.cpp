@@ -984,11 +984,12 @@ namespace plume {
         uint32_t nextTextureIndex = 0;
         bool vsyncEnabled = true;
 
-        // What needsResize() and getRefreshRate() answer: the backend's answers at the last present, resize or refresh on
-        // the device thread. A caller that waited for them each frame waited behind everything queued before (RT64's
-        // present thread asks both before every present), so it reads these and queues a refresh instead.
+        // What needsResize(), getRefreshRate() and isHidden() answer: the backend's answers at the last present, resize or
+        // refresh on the device thread. A caller that waited for them each frame waited behind everything queued before
+        // (RT64's present thread asks them before every present), so it reads these and queues a refresh instead.
         mutable std::atomic<bool> innerNeedsResize = false;
         mutable std::atomic<uint32_t> innerRefreshRate = 0;
+        mutable std::atomic<bool> innerHidden = false;
         mutable std::atomic<bool> refreshing = false;
 
         // The presents queued for the device thread that haven't reached the backend's present() yet, which waitOnCaller()
@@ -1048,6 +1049,7 @@ namespace plume {
         void publish() const {
             innerNeedsResize = inner->needsResize();
             innerRefreshRate = inner->getRefreshRate();
+            innerHidden = inner->isHidden();
         }
 
         // Queues a publish(), unless one is queued already.
@@ -1205,6 +1207,11 @@ namespace plume {
         uint32_t getRefreshRate() const override {
             refresh();
             return innerRefreshRate;
+        }
+
+        bool isHidden() const override {
+            refresh();
+            return innerHidden;
         }
     };
 

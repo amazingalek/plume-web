@@ -119,6 +119,10 @@ namespace plume {
         // plume_device_thread.cpp's native test reaches it.
         virtual bool waitOnCaller(const std::atomic<uint32_t> &queued) { return false; }
 
+        // Whether the window is hidden, where the backend can tell: a page in a tab behind another, or minimized (WebGPU).
+        // Nothing presented then is seen, and a caller can stop presenting. Any thread may call it.
+        virtual bool isHidden() const { return false; }
+
         virtual bool resize() = 0;
         virtual bool needsResize() const = 0;
         virtual void setVsyncEnabled(bool vsyncEnabled) = 0;

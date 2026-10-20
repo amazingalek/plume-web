@@ -48,6 +48,11 @@ EM_JS(int, plume_webgpu_bgra_swap_chain, (), {
     return navigator.gpu.getPreferredCanvasFormat() === 'bgra8unorm' ? 1 : 0;
 });
 
+// Whether the page is hidden: in a tab behind another, or a window minimized.
+EM_JS(int, plume_webgpu_document_hidden, (), {
+    return ((typeof document !== 'undefined') && document.hidden) ? 1 : 0;
+});
+
 // A number from the page's query: -1 without the name, 0 for one with no number (present-stats).
 EM_JS(int, plume_webgpu_query_number, (const char *name), {
     const value = new URLSearchParams(globalThis.location ? location.search : '').get(UTF8ToString(name));
@@ -1794,7 +1799,7 @@ namespace plume {
         for (;;) {
             const uint32_t queuedNow = queued;
             const uint32_t inFlight = presentState->inFlight;
-            if ((queuedNow + inFlight) < maxPresentsInFlight) {
+            if (((queuedNow + inFlight) < maxPresentsInFlight) || presentState->hidden) {
                 break;
             }
 
@@ -2068,6 +2073,19 @@ namespace plume {
 
     uint32_t WebGPUSwapChain::getRefreshRate() const {
         return (uncappedRate > 0) ? uncappedRate : frameTimer->refreshRate;
+    }
+
+    // On the page's thread it asks the document, and keeps the answer for other threads and waitOnCaller(), which it
+    // wakes when the page is hidden.
+    bool WebGPUSwapChain::isHidden() const {
+        if (emscripten_is_main_browser_thread()) {
+            const bool hidden = (plume_webgpu_document_hidden() != 0);
+            if (hidden != presentState->hidden.exchange(hidden)) {
+                emscripten_futex_wake(&presentState->inFlight, INT_MAX);
+            }
+        }
+
+        return presentState->hidden;
     }
 
     // WebGPUFramebuffer

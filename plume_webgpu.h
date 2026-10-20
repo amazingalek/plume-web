@@ -93,7 +93,11 @@
 // - The browser doesn't say what the display's refresh rate is, so a swap chain times the animation frames with a
 //   loop of its own on the device's thread, whatever its caller presents at, and reports displayTiming. The loop wakes
 //   a thread in sleepUntil() at each frame, where a timed sleep on a page's thread ends late (plume_web_waits.h).
-//   sleepUntil() and waitOnCaller() are the calls another thread may make.
+//   sleepUntil(), waitOnCaller() and isHidden() are the calls another thread may make.
+// - isHidden() is document.hidden, asked on the page's thread. While the page is hidden, waitOnCaller() doesn't hold a
+//   present to the cap on presents in flight: nothing is shown then, and Chrome calls a hidden page's
+//   onSubmittedWorkDone back late, at times by seconds for the first 5-15 s (an empty submission's callback came back
+//   0-12 times a second, against 80 shown, RTX 2070), so a caller that waited for it held its game behind it.
 // - Every call must come from the thread that owns the device's JavaScript object: WebGPU objects can't be shared
 //   between workers.
 // - Shaders are WGSL text (RenderShaderFormat::WGSL). Specialization constants are WGSL overrides named by their id,
@@ -382,10 +386,12 @@ namespace plume {
 
     // The presents whose work the GPU hasn't finished (a futex, woken as each is done), and for present-stats how long
     // each one's took to be reported done. Shared with their callbacks, which can outlive the swap chain. inFlight,
-    // caughtUp and waitedMs (the time waitOnCaller() held presents, not yet counted) are read on other threads too.
+    // caughtUp, hidden (isHidden()'s last answer) and waitedMs (the time waitOnCaller() held presents, not yet counted)
+    // are read on other threads too.
     struct WebGPUPresentState {
         std::atomic<uint32_t> inFlight = 0;
         std::atomic<bool> caughtUp = false;
+        std::atomic<bool> hidden = false;
         std::atomic<double> waitedMs = 0.0;
         bool timeWorkDone = false;
         std::vector<double> workDoneMs;
@@ -438,6 +444,7 @@ namespace plume {
         bool isWaitReady() override;
         bool sleepUntil(std::chrono::steady_clock::time_point time) override;
         bool waitOnCaller(const std::atomic<uint32_t> &queued) override;
+        bool isHidden() const override;
         bool resize() override;
         bool needsResize() const override;
         void setVsyncEnabled(bool vsyncEnabled) override;
