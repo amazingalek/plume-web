@@ -2288,9 +2288,12 @@ namespace plume {
                     wgpuBindGroupRelease(passGroup);
                 }
 
-                passGroup = (offsetCount == 0) ? bindGroup : nullptr;
-                if (passGroup != nullptr) {
-                    wgpuBindGroupAddRef(passGroup);
+                // A group bound at an offset is held too, but is never the same as one bound without (its layout's
+                // binding is dynamic), and the push constants' slot is tracked beside it.
+                passGroup = bindGroup;
+                wgpuBindGroupAddRef(passGroup);
+                if (groupIndex == PushConstantsGroup) {
+                    pass.pushConstantsBound = false;
                 }
             }
             else {
@@ -2317,7 +2320,42 @@ namespace plume {
             setBindGroup(i, device->emptyBindGroup, 0, nullptr);
         }
 
-        // Every draw or dispatch gets its own copy of the block in the ring.
+        // The binding's size is part of the bind group, so a chunk keeps one group per block size.
+        const uint32_t bindingSize = uint32_t(alignUp(pushConstantsSize, 16));
+        WebGPUDescriptorSet *sharedSet = (state.layout->descriptorSetCount > PushConstantsGroup) ? state.descriptorSets[PushConstantsGroup] : nullptr;
+        auto chunkBindGroup = [&](PushConstantsChunk &chunk) {
+            WGPUBindGroup &chunkGroup = chunk.bindGroups[bindingSize];
+            if ((sharedSet == nullptr) && (chunkGroup == nullptr)) {
+                WGPUBindGroupEntry entry = WGPU_BIND_GROUP_ENTRY_INIT;
+                entry.binding = PushConstantsBinding;
+                entry.buffer = chunk.buffer;
+                entry.offset = 0;
+                entry.size = bindingSize;
+                WGPUBindGroupDescriptor groupDesc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+                groupDesc.layout = device->pushConstantsLayout;
+                groupDesc.entryCount = 1;
+                groupDesc.entries = &entry;
+                chunkGroup = wgpuDeviceCreateBindGroup(device->device, &groupDesc);
+            }
+
+            return (sharedSet != nullptr) ? sharedSet->getBindGroupWithPushConstants(chunk.buffer, chunk.id, bindingSize) : chunkGroup;
+        };
+
+        // A render pass that has the same bytes bound already, through the same group, binds nothing again: a renderer
+        // that sets its push constants before every draw (RT64's raster draws) mostly sets the same block, and on a page
+        // each slot is bytes for writeBuffer and each bind a setBindGroup on the page's thread.
+        state.pushConstants.resize(pushConstantsSize, 0);
+        if ((renderPass != nullptr) && pass.pushConstantsBound && (pass.pushConstantsSize == pushConstantsSize)) {
+            PushConstantsChunk &passChunk = pushConstantsChunks[pass.pushConstantsChunkIndex];
+            if ((memcmp(passChunk.data.data() + pass.pushConstantsOffset, state.pushConstants.data(), pushConstantsSize) == 0) &&
+                (chunkBindGroup(passChunk) == pass.bindGroups[PushConstantsGroup]))
+            {
+                state.pushConstantsDirty = false;
+                return;
+            }
+        }
+
+        // Every other draw or dispatch gets its own copy of the block in the ring.
         const uint32_t slotSize = uint32_t(alignUp(pushConstantsSize, PushConstantsAlignment));
         assert(slotSize <= PushConstantsChunkSize);
         if ((pushConstantsChunkIndex < pushConstantsChunks.size()) && (pushConstantsChunks[pushConstantsChunkIndex].used + slotSize > PushConstantsChunkSize)) {
@@ -2335,31 +2373,20 @@ namespace plume {
             pushConstantsChunks.emplace_back(std::move(chunk));
         }
 
-        // The binding's size is part of the bind group, so a chunk keeps one group per block size.
         PushConstantsChunk &chunk = pushConstantsChunks[pushConstantsChunkIndex];
-        const uint32_t bindingSize = uint32_t(alignUp(pushConstantsSize, 16));
-        WebGPUDescriptorSet *sharedSet = (state.layout->descriptorSetCount > PushConstantsGroup) ? state.descriptorSets[PushConstantsGroup] : nullptr;
-        WGPUBindGroup &chunkGroup = chunk.bindGroups[bindingSize];
-        if ((sharedSet == nullptr) && (chunkGroup == nullptr)) {
-            WGPUBindGroupEntry entry = WGPU_BIND_GROUP_ENTRY_INIT;
-            entry.binding = PushConstantsBinding;
-            entry.buffer = chunk.buffer;
-            entry.offset = 0;
-            entry.size = bindingSize;
-            WGPUBindGroupDescriptor groupDesc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
-            groupDesc.layout = device->pushConstantsLayout;
-            groupDesc.entryCount = 1;
-            groupDesc.entries = &entry;
-            chunkGroup = wgpuDeviceCreateBindGroup(device->device, &groupDesc);
-        }
-
-        WGPUBindGroup bindGroup = (sharedSet != nullptr) ? sharedSet->getBindGroupWithPushConstants(chunk.buffer, chunk.id, bindingSize) : chunkGroup;
+        WGPUBindGroup bindGroup = chunkBindGroup(chunk);
 
         const uint32_t offset = chunk.used;
-        state.pushConstants.resize(pushConstantsSize, 0);
         memcpy(chunk.data.data() + offset, state.pushConstants.data(), pushConstantsSize);
         chunk.used += slotSize;
         setBindGroup(PushConstantsGroup, bindGroup, 1, &offset);
+        if (renderPass != nullptr) {
+            pass.pushConstantsBound = true;
+            pass.pushConstantsChunkIndex = pushConstantsChunkIndex;
+            pass.pushConstantsOffset = offset;
+            pass.pushConstantsSize = pushConstantsSize;
+        }
+
         state.pushConstantsDirty = false;
     }
 

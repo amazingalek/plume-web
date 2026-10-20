@@ -508,6 +508,11 @@ namespace plume {
         struct PassState {
             WGPURenderPipeline pipeline = nullptr;
             WGPUBindGroup bindGroups[MaxDescriptorSets] = {};
+            // Where in the ring the push constants bound to PushConstantsGroup are, and how many bytes of them.
+            bool pushConstantsBound = false;
+            uint32_t pushConstantsChunkIndex = 0;
+            uint32_t pushConstantsOffset = 0;
+            uint32_t pushConstantsSize = 0;
             uint32_t stencilReference = 0;
             bool stencilReferenceSet = false;
             RenderVertexBufferView vertexBuffers[MaxVertexBuffers] = {};

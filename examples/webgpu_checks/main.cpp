@@ -10,6 +10,8 @@
 // - a formatted R8_UINT buffer of 7 bytes, bound as storage and unpacked by the shader;
 // - clears of rectangles of color and depth, with a draw after them that needs its own viewport back;
 // - push constants beside 4 descriptor sets, sharing bind group 3 with the 4th;
+// - push constants across the draws of a pass, the same block again bound once, and instance_index counting from the
+//   draw's first instance;
 // - a compute shader writing an rgba8unorm storage texture, which WebGPU only allows write-only;
 // - present() paced to animation frames, and the refresh rate it measures.
 // Each check prints a line, then "plume WebGPU checks: N of M passed", and the canvas ends green when all passed.
@@ -74,6 +76,19 @@ static const char DrawShader[] = R"(
 }
 @fragment fn fs() -> @location(0) vec4f {
     return vec4f(0.0, 0.0, 1.0, 1.0);
+}
+)";
+
+static const char PushConstantsDrawShader[] = R"(
+struct PushConstants { color: vec4f }
+@group(3) @binding(999) var<uniform> pushConstants: PushConstants;
+@vertex fn vs(@builtin(vertex_index) v: u32, @builtin(instance_index) i: u32) -> @builtin(position) vec4f {
+    let corners = array(vec2f(0.0, 0.0), vec2f(1.0, 0.0), vec2f(0.0, 1.0), vec2f(0.0, 1.0), vec2f(1.0, 0.0), vec2f(1.0, 1.0));
+    let c = corners[v];
+    return vec4f(f32(i) * 0.5 - 1.0 + c.x * 0.5, c.y * 2.0 - 1.0, 0.5, 1.0);
+}
+@fragment fn fs() -> @location(0) vec4f {
+    return pushConstants.color;
 }
 )";
 
@@ -196,6 +211,55 @@ static void checkPushConstantsWithFourSets(Context &ctx) {
     char detail[96];
     snprintf(detail, sizeof(detail), "read %u %u", results[0], results[1]);
     check((results[0] == 4321) && (results[1] == 50321), "push constants sharing group 3 with a 4th descriptor set", detail);
+    readback->unmap();
+}
+
+// Four draws in one pass, each into the quarter of the target its first instance picks, set red, red, green and red
+// through push constants: the second binds nothing (the pass has the same block bound), and the fourth has to bind red
+// again.
+static void checkPushConstantsAcrossDraws(Context &ctx) {
+    const uint32_t Size = 64;
+    auto color = ctx.device->createTexture(RenderTextureDesc::ColorTarget(Size, Size, RenderFormat::R8G8B8A8_UNORM));
+    const RenderTexture *colorTargets[] = { color.get() };
+    auto framebuffer = ctx.device->createFramebuffer(RenderFramebufferDesc(colorTargets, 1));
+    const RenderPushConstantRange pushConstantRange(0, 0, 0, 4 * sizeof(float), RenderShaderStageFlag::VERTEX | RenderShaderStageFlag::PIXEL);
+    auto layout = ctx.device->createPipelineLayout(RenderPipelineLayoutDesc(&pushConstantRange, 1, nullptr, 0));
+    auto vertexShader = ctx.device->createShader(PushConstantsDrawShader, strlen(PushConstantsDrawShader), "vs", RenderShaderFormat::WGSL);
+    auto pixelShader = ctx.device->createShader(PushConstantsDrawShader, strlen(PushConstantsDrawShader), "fs", RenderShaderFormat::WGSL);
+    RenderGraphicsPipelineDesc pipelineDesc;
+    pipelineDesc.pipelineLayout = layout.get();
+    pipelineDesc.vertexShader = vertexShader.get();
+    pipelineDesc.pixelShader = pixelShader.get();
+    pipelineDesc.renderTargetFormat[0] = RenderFormat::R8G8B8A8_UNORM;
+    pipelineDesc.renderTargetBlend[0] = RenderBlendDesc::Copy();
+    pipelineDesc.renderTargetCount = 1;
+    auto pipeline = ctx.device->createGraphicsPipeline(pipelineDesc);
+    auto readback = ctx.device->createBuffer(RenderBufferDesc::ReadbackBuffer(Size * Size * 4));
+
+    const float colors[4][4] = { { 1.0f, 0.0f, 0.0f, 1.0f }, { 1.0f, 0.0f, 0.0f, 1.0f }, { 0.0f, 1.0f, 0.0f, 1.0f }, { 1.0f, 0.0f, 0.0f, 1.0f } };
+    ctx.commandList->begin();
+    ctx.commandList->setFramebuffer(framebuffer.get());
+    ctx.commandList->setGraphicsPipelineLayout(layout.get());
+    ctx.commandList->setPipeline(pipeline.get());
+    ctx.commandList->setViewports(RenderViewport(0.0f, 0.0f, float(Size), float(Size)));
+    ctx.commandList->setScissors(RenderRect(0, 0, Size, Size));
+    ctx.commandList->clearColor(0, RenderColor(0.0f, 0.0f, 1.0f, 1.0f));
+    for (uint32_t i = 0; i < 4; i++) {
+        ctx.commandList->setGraphicsPushConstants(0, colors[i], 0, sizeof(colors[i]));
+        ctx.commandList->drawInstanced(6, 1, 0, i);
+    }
+
+    ctx.commandList->setFramebuffer(nullptr);
+    ctx.commandList->copyTextureRegion(RenderTextureCopyLocation::PlacedFootprint(readback.get(), RenderFormat::R8G8B8A8_UNORM, Size, Size, 1, Size), RenderTextureCopyLocation::Subresource(color.get()));
+    ctx.execute();
+
+    const uint32_t *pixels = static_cast<const uint32_t *>(readback->map());
+    const uint32_t Red = 0xFF0000FF, Green = 0xFF00FF00;
+    const uint32_t row = (Size / 2) * Size;
+    const uint32_t quarters[4] = { pixels[row + 8], pixels[row + 24], pixels[row + 40], pixels[row + 56] };
+    char detail[160];
+    snprintf(detail, sizeof(detail), "quarters %08X %08X %08X %08X", quarters[0], quarters[1], quarters[2], quarters[3]);
+    check((quarters[0] == Red) && (quarters[1] == Red) && (quarters[2] == Green) && (quarters[3] == Red), "push constants across a pass's draws, placed by their first instance", detail);
     readback->unmap();
 }
 
@@ -356,6 +420,7 @@ static void runChecks(std::unique_ptr<RenderInterface> renderInterface) {
 #endif
     checkFormattedBufferAndReadback(ctx);
     checkPushConstantsWithFourSets(ctx);
+    checkPushConstantsAcrossDraws(ctx);
     checkStorageTexture(ctx);
     checkRectangleClears(ctx);
     checkPresent(ctx);
