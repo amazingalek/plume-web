@@ -52,4 +52,13 @@ namespace plume {
     }
 };
 
+#else
+
+namespace plume {
+    // Without threads the page's is the only one, and it can't wait.
+    inline bool timedWaitsEndLate() {
+        return false;
+    }
+};
+
 #endif
