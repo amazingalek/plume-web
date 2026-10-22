@@ -1764,28 +1764,48 @@ namespace plume {
     // Where a timed wait on a page's thread ends late (plume_web_waits.h: Firefox on Windows, on the system timer's 15.6
     // ms tick), RT64's sleeps of 100 us until each present's time took a tick each, and a present was late by up to a
     // tick. A wake through the futex comes at once, so there this waits for the animation frames, the display's own
-    // timing, and on a timer only until the time itself, for a page whose frames have stopped (hidden). Elsewhere it
-    // returns false and the caller sleeps as before: in Chrome on a laptop's Intel graphics, presents on the animation
-    // frames made the GPU busier and the gaps between frames longer than RT64's own sleeps.
-    // While timed waits are judged on time, each call first waits up to 100 us for a frame, as long as the caller's own
-    // first sleep, and that wait is judged (judgeTimedWait()): the present thread's sleeps are what a page's presents
-    // hang on, and once they end late, sleeps here are on the frames for the rest of the play. Pokemon Snap's page in
-    // Firefox 158 (uncapped, RTX 5080), held to RT64's sleeps, woke 140 ms past its slots in the launcher and 0.1 ms past
-    // them once the game ran, presenting 308-330 a second, but in 1 play of 4 they stayed late all through and it
-    // presented 94, and in later plays its waits turned late at its menus or its level and it presented 172-176; on the
-    // animation frames it presented 206-232, and 206-218 turned to them after 10 late seconds.
+    // timing, and on a timer only until the time itself, for a page whose frames have stopped (hidden): in Chrome on a
+    // laptop's Intel graphics, presents on the animation frames made the GPU busier and the gaps between frames longer
+    // than RT64's own sleeps, so only there.
+    // Where they are judged on time, this sleeps until the time itself: woken by each animation frame that comes before
+    // it (a wake, which ends a wait at once) and spinning on the clock from the last of them, no more than a frame and
+    // 2 ms. Not RT64's own sleeps: one of its 100 us sleeps in Chrome (on an RTX 5080's 240 Hz display) now and then
+    // took up to 16 ms, a tick, though the 100 us waits judged beside them ended on time, and woke its present 5-30 ms
+    // past its slot, holding a frame on screen and then two at once; RT64's pacing took those drops for a GPU falling
+    // behind and held Perfect Dark's page at 60 presents a second for half a play, at 120 for the rest, where the
+    // display gives 240. A spin in their place woke within 0.3 ms of every slot. Woken by the frames and spun from the
+    // last, the page presented 212 and 213 a second against 112 and 117 (Defection at 210-228 against 108-131), no
+    // present woke 4 ms late, and its frames' p99 gap was 17-18 ms against 20-21.
+    // While timed waits are judged on time, the waits for frames that end on their time are judged (judgeTimedWait()):
+    // the present thread's sleeps are what a page's presents hang on, and once they end late, sleeps here are on the
+    // frames for the rest of the play. Pokemon Snap's page in Firefox 158 (uncapped, RTX 5080), held to RT64's sleeps,
+    // woke 140 ms past its slots in the launcher and 0.1 ms past them once the game ran, presenting 308-330 a second,
+    // but in 1 play of 4 they stayed late all through and it presented 94, and in later plays its waits turned late at
+    // its menus or its level and it presented 172-176; on the animation frames it presented 206-232, and 206-218 turned
+    // to them after 10 late seconds.
     bool WebGPUSwapChain::sleepUntil(std::chrono::steady_clock::time_point time) {
         if (emscripten_is_main_browser_thread()) {
             return false;
         }
 
         const double endMs = emscripten_get_now() + std::chrono::duration<double, std::milli>(time - std::chrono::steady_clock::now()).count();
-        if (!timedWaitsEndLate() && ((endMs - emscripten_get_now()) > 0.5)) {
-            judgeTimedWait(&frameTimer->frameSerial, frameTimer->frameSerial, 0.1);
-        }
-
         if (!timedWaitsEndLate()) {
-            return false;
+            const double SpinLeadMs = 2.0;
+            for (;;) {
+                const uint32_t serial = frameTimer->frameSerial;
+                const double now = emscripten_get_now();
+                const double nextFrameMs = std::max(frameTimer->frameNow + frameTimer->frameMs, now);
+                if (((nextFrameMs + SpinLeadMs) >= endMs) || timedWaitsEndLate()) {
+                    break;
+                }
+
+                judgeTimedWait(&frameTimer->frameSerial, serial, endMs - SpinLeadMs - now);
+            }
+
+            while (emscripten_get_now() < endMs) {
+            }
+
+            return true;
         }
 
         const double fromMs = endMs - frameTimer->frameMs / 2.0;

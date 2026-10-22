@@ -105,10 +105,11 @@ namespace plume {
         // device's can wait for it to turn true.
         virtual bool isWaitReady() { return true; }
 
-        // Holds the calling thread until about the given time, and ends on a frame of the display where the backend
-        // learns of them as they come (WebGPU's animation frames): on the first one less than half a frame before that
-        // time, or at the time if none comes by then. False at once where it can't or a timed sleep ends on time, and
-        // the caller sleeps itself. Any thread but the device's may call it.
+        // Holds the calling thread until about the given time where the backend learns of the display's frames as they
+        // come (WebGPU's animation frames): where timed sleeps end late, it ends on the first frame less than half a
+        // frame before that time, or at the time if none comes by then; elsewhere at the time itself, woken by the
+        // frames before it and spinning from the last. False at once where it can't, and the caller sleeps itself.
+        // Any thread but the device's may call it.
 #if defined(__EMSCRIPTEN__)
         virtual bool sleepUntil(std::chrono::steady_clock::time_point time) { return false; }
 #endif
