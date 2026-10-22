@@ -1767,12 +1767,27 @@ namespace plume {
     // timing, and on a timer only until the time itself, for a page whose frames have stopped (hidden). Elsewhere it
     // returns false and the caller sleeps as before: in Chrome on a laptop's Intel graphics, presents on the animation
     // frames made the GPU busier and the gaps between frames longer than RT64's own sleeps.
+    // While timed waits are judged on time, each call first waits up to 100 us for a frame, as long as the caller's own
+    // first sleep, and that wait is judged (judgeTimedWait()): the present thread's sleeps are what a page's presents
+    // hang on, and once they end late, sleeps here are on the frames for the rest of the play. Pokemon Snap's page in
+    // Firefox 158 (uncapped, RTX 5080), held to RT64's sleeps, woke 140 ms past its slots in the launcher and 0.1 ms past
+    // them once the game ran, presenting 308-330 a second, but in 1 play of 4 they stayed late all through and it
+    // presented 94, and in later plays its waits turned late at its menus or its level and it presented 172-176; on the
+    // animation frames it presented 206-232, and 206-218 turned to them after 10 late seconds.
     bool WebGPUSwapChain::sleepUntil(std::chrono::steady_clock::time_point time) {
-        if (emscripten_is_main_browser_thread() || !timedWaitsEndLate()) {
+        if (emscripten_is_main_browser_thread()) {
             return false;
         }
 
         const double endMs = emscripten_get_now() + std::chrono::duration<double, std::milli>(time - std::chrono::steady_clock::now()).count();
+        if (!timedWaitsEndLate() && ((endMs - emscripten_get_now()) > 0.5)) {
+            judgeTimedWait(&frameTimer->frameSerial, frameTimer->frameSerial, 0.1);
+        }
+
+        if (!timedWaitsEndLate()) {
+            return false;
+        }
+
         const double fromMs = endMs - frameTimer->frameMs / 2.0;
         for (;;) {
             const uint32_t serial = frameTimer->frameSerial;
