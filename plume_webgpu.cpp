@@ -1732,6 +1732,7 @@ namespace plume {
 
         const double waitedMs = presentState->waitedMs.exchange(0.0);
         statsWaitMs += waitedMs;
+        statsSpunMs += presentState->spunMs.exchange(0.0);
         capWaitMs += waitedMs;
         if (presentStats) {
             statsPresents++;
@@ -1769,13 +1770,19 @@ namespace plume {
     // than RT64's own sleeps, so only there.
     // Where they are judged on time, this sleeps until the time itself: woken by each animation frame that comes before
     // it (a wake, which ends a wait at once) and spinning on the clock from the last of them, no more than a frame and
-    // 2 ms. Not RT64's own sleeps: one of its 100 us sleeps in Chrome (on an RTX 5080's 240 Hz display) now and then
+    // 0.5 ms. Not a timed wait to just before it either: in a game's page in Chrome on Windows a tenth of the timed
+    // waits of 1.5 ms ended 4-16 ms late, the system timer's tick, whether or not the page kept a 1 ms timer of its own
+    // pending. Not RT64's own sleeps: one of its 100 us sleeps in Chrome (on an RTX 5080's 240 Hz display) now and then
     // took up to 16 ms, a tick, though the 100 us waits judged beside them ended on time, and woke its present 5-30 ms
     // past its slot, holding a frame on screen and then two at once; RT64's pacing took those drops for a GPU falling
     // behind and held Perfect Dark's page at 60 presents a second for half a play, at 120 for the rest, where the
     // display gives 240. A spin in their place woke within 0.3 ms of every slot. Woken by the frames and spun from the
     // last, the page presented 212 and 213 a second against 112 and 117 (Defection at 210-228 against 108-131), no
     // present woke 4 ms late, and its frames' p99 gap was 17-18 ms against 20-21.
+    // The spin is a core's time whenever a page sleeps to its slots (the display faster than the game): from a frame 2 ms
+    // before the slot, Mario Kart 64's page spun 635-646 ms a second at 174 animation frames a second and 493-526 at 57,
+    // Perfect Dark's 405-412 at 172; from one 0.5 ms before, 462-483 and 304-310 at the same presents a second, and no
+    // sleep woke later for it (Chrome 155, RTX 5080).
     // While timed waits are judged on time, the waits for frames that end on their time are judged (judgeTimedWait()):
     // the present thread's sleeps are what a page's presents hang on, and once they end late, sleeps here are on the
     // frames for the rest of the play. Pokemon Snap's page in Firefox 158 (uncapped, RTX 5080), held to RT64's sleeps,
@@ -1790,7 +1797,7 @@ namespace plume {
 
         const double endMs = emscripten_get_now() + std::chrono::duration<double, std::milli>(time - std::chrono::steady_clock::now()).count();
         if (!timedWaitsEndLate()) {
-            const double SpinLeadMs = 2.0;
+            const double SpinLeadMs = 0.5;
             for (;;) {
                 const uint32_t serial = frameTimer->frameSerial;
                 const double now = emscripten_get_now();
@@ -1802,7 +1809,14 @@ namespace plume {
                 judgeTimedWait(&frameTimer->frameSerial, serial, endMs - SpinLeadMs - now);
             }
 
-            while (emscripten_get_now() < endMs) {
+            const double spinStart = emscripten_get_now();
+            double spinNow = spinStart;
+            while (spinNow < endMs) {
+                spinNow = emscripten_get_now();
+            }
+
+            double counted = presentState->spunMs;
+            while (!presentState->spunMs.compare_exchange_weak(counted, counted + (spinNow - spinStart))) {
             }
 
             return true;
@@ -1979,6 +1993,7 @@ namespace plume {
             statsPresents = 0;
             statsFrameCount = frameTimer->frameCount;
             statsWaitMs = 0.0;
+            statsSpunMs = 0.0;
             presentState->workDoneMs.clear();
             return;
         }
@@ -1995,14 +2010,16 @@ namespace plume {
         };
 
         printf("plume: %.1f presents a second, each done on the GPU %.0f ms after it (median; %.0f at p90, %.0f at most), "
-            "%.0f ms a second waiting for fewer than %u in flight, %.1f animation frames a second (display read as %u Hz)\n",
+            "%.0f ms a second waiting for fewer than %u in flight, %.0f ms a second spun on the clock to a present's time, "
+            "%.1f animation frames a second (display read as %u Hz)\n",
             statsPresents / seconds, quantile(0.5), quantile(0.9), quantile(1.0), statsWaitMs / seconds, maxPresentsInFlight.load(),
-            (frameTimer->frameCount - statsFrameCount) / seconds, frameTimer->refreshRate);
+            statsSpunMs / seconds, (frameTimer->frameCount - statsFrameCount) / seconds, frameTimer->refreshRate);
 
         statsStartTime = now;
         statsPresents = 0;
         statsFrameCount = frameTimer->frameCount;
         statsWaitMs = 0.0;
+        statsSpunMs = 0.0;
         workDoneMs.clear();
     }
 

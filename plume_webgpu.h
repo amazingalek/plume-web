@@ -79,7 +79,8 @@
 //   presents rise (adaptPresentsInFlight()), but only from presents steady before the try: after a stall any recovery is
 //   a rise. The page's query can fix the number (presents-in-flight=<1-8>), and
 //   present-stats prints a line every 5 s: presents a second, how long after its present each frame's onSubmittedWorkDone
-//   came back, the time wait() held presents, and the animation frames a second, and each try that goes back. On a GPU
+//   came back, the time wait() held presents, the time sleepUntil() spun on the clock, and the animation frames a
+//   second, and each try that goes back. On a GPU
 //   at hand, that says whether the GPU, the callbacks or the browser's frames hold presents back. uncapped=<rate>
 //   reports the display's rate as <rate> (360) and keeps 4 in flight, to measure how many presents a second a page can
 //   make with the browser's own frames uncapped (the swap chain's constructor says how).
@@ -386,13 +387,14 @@ namespace plume {
 
     // The presents whose work the GPU hasn't finished (a futex, woken as each is done), and for present-stats how long
     // each one's took to be reported done. Shared with their callbacks, which can outlive the swap chain. inFlight,
-    // caughtUp, hidden (isHidden()'s last answer) and waitedMs (the time waitOnCaller() held presents, not yet counted)
-    // are read on other threads too.
+    // caughtUp, hidden (isHidden()'s last answer), waitedMs (the time waitOnCaller() held presents, not yet counted) and
+    // spunMs (the time sleepUntil() spun on the clock, not yet counted) are read on other threads too.
     struct WebGPUPresentState {
         std::atomic<uint32_t> inFlight = 0;
         std::atomic<bool> caughtUp = false;
         std::atomic<bool> hidden = false;
         std::atomic<double> waitedMs = 0.0;
+        std::atomic<double> spunMs = 0.0;
         bool timeWorkDone = false;
         std::vector<double> workDoneMs;
     };
@@ -436,6 +438,7 @@ namespace plume {
         uint32_t statsPresents = 0;
         uint32_t statsFrameCount = 0;
         double statsWaitMs = 0.0;
+        double statsSpunMs = 0.0;
 
         WebGPUSwapChain(WebGPUCommandQueue *commandQueue, const RenderSwapChainDesc &desc);
         ~WebGPUSwapChain() override;
