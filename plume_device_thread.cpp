@@ -256,22 +256,47 @@ namespace plume {
         }
     };
 
+    // The upload buffers mapped on the calling side and not unmapped yet. Before each execution what they hold is copied
+    // and written to the backend's, as a backend writes a buffer left mapped at each submission.
+    struct DTBuffer;
+    static std::mutex mappedUploadsMutex;
+    static std::vector<DTBuffer *> mappedUploads;
+
+    static void setUploadMapped(DTBuffer *buffer, bool mapped) {
+        std::scoped_lock lock(mappedUploadsMutex);
+        auto it = std::find(mappedUploads.begin(), mappedUploads.end(), buffer);
+        if (mapped && (it == mappedUploads.end())) {
+            mappedUploads.emplace_back(buffer);
+        }
+        else if (!mapped && (it != mappedUploads.end())) {
+            mappedUploads.erase(it);
+        }
+    }
+
     struct DTBuffer : RenderBuffer {
         DeviceThread *thread = nullptr;
         RenderBuffer *inner = nullptr;
         std::shared_ptr<DTMapState> mapState;
         bool uploadHeap = false;
-        std::atomic<void *> uploadData = nullptr;
+        uint64_t size = 0;
 
-        DTBuffer(DeviceThread *thread, std::unique_ptr<RenderBuffer> inner, RenderHeapType heapType) : thread(thread), inner(inner.release()) {
-            uploadHeap = (heapType == RenderHeapType::UPLOAD) || (heapType == RenderHeapType::GPU_UPLOAD);
-            if (heapType == RenderHeapType::READBACK) {
+        // An upload buffer's memory on the calling side (map()).
+        std::unique_ptr<uint8_t[]> uploadCopy;
+        std::once_flag uploadCopyMade;
+
+        DTBuffer(DeviceThread *thread, std::unique_ptr<RenderBuffer> inner, const RenderBufferDesc &desc) : thread(thread), inner(inner.release()), size(desc.size) {
+            uploadHeap = (desc.heapType == RenderHeapType::UPLOAD) || (desc.heapType == RenderHeapType::GPU_UPLOAD);
+            if (desc.heapType == RenderHeapType::READBACK) {
                 mapState = std::make_shared<DTMapState>();
                 mapState->inner = this->inner;
             }
         }
 
         ~DTBuffer() override {
+            if (uploadHeap) {
+                setUploadMapped(this, false);
+            }
+
             if (mapState != nullptr) {
                 destroyAsync(thread, new DTMapRelease{ mapState });
             }
@@ -312,20 +337,15 @@ namespace plume {
                 }
             }
 
-            // An upload buffer maps at the same address every time (WebGPU's is a copy in memory that unmap() writes to
-            // the buffer, Vulkan's and D3D12's stay mapped), so after its first map() the backend's is queued and the
-            // caller writes there at once. Each one waited for the device thread: RT64 maps ~30 a frame, 1,700 a second
-            // in Pilotwings 64's menus, each 0.1-0.2 ms behind the page's thread.
+            // An upload buffer is mapped at memory of its own on the calling side, the same every time, without waiting
+            // for the device thread (RT64 maps ~30 a frame, 1,700 a second in Pilotwings 64's menus, and each map that
+            // waited was 0.1-0.2 ms behind the page's thread). unmap() copies what was written and queues the copy for
+            // the backend's buffer, so the caller can write the next data at once, before the device thread has got to
+            // the last: waitForCommandFence() doesn't wait for it.
             if (uploadHeap && (subresource == 0)) {
-                void *data = uploadData.load(std::memory_order_acquire);
-                if (data != nullptr) {
-                    thread->runAsync([buffer = inner]() { buffer->map(0, nullptr); });
-                    return data;
-                }
-
-                data = runSync(thread, [&]() { return inner->map(subresource, readRange); });
-                uploadData.store(data, std::memory_order_release);
-                return data;
+                std::call_once(uploadCopyMade, [&]() { uploadCopy.reset(new uint8_t[size]()); });
+                setUploadMapped(this, true);
+                return uploadCopy.get();
             }
 
             const std::thread::id caller = std::this_thread::get_id();
@@ -365,7 +385,17 @@ namespace plume {
             RenderBuffer *buffer = inner;
             const bool ranged = (writtenRange != nullptr);
             const RenderRange range = ranged ? *writtenRange : RenderRange();
-            if (mapState != nullptr) {
+            if (uploadHeap && (subresource == 0) && (uploadCopy != nullptr)) {
+                setUploadMapped(this, false);
+                const uint64_t begin = ranged ? std::min(range.begin, size) : 0;
+                const uint64_t end = ranged ? std::min(std::max(range.end, begin), size) : size;
+                thread->runAsync([buffer, begin, bytes = std::vector<uint8_t>(uploadCopy.get() + begin, uploadCopy.get() + end), ranged, range]() {
+                    uint8_t *data = static_cast<uint8_t *>(buffer->map(0, nullptr));
+                    memcpy(data + begin, bytes.data(), bytes.size());
+                    buffer->unmap(0, ranged ? &range : nullptr);
+                });
+            }
+            else if (mapState != nullptr) {
                 thread->runAsync([state = mapState, subresource, ranged, range]() { state->unmap(subresource, ranged ? &range : nullptr); });
             }
             else {
@@ -544,9 +574,20 @@ namespace plume {
         ~DTPipelineLayout() override { destroyAsync(thread, inner); }
     };
 
+    // The executions that signal a fence: those queued, those replayed on the device thread, and those the last
+    // waitForCommandFence() came after.
+    struct DTFenceState {
+        std::mutex mutex;
+        std::condition_variable replayedCondition;
+        uint64_t queued = 0;
+        uint64_t replayed = 0;
+        uint64_t waited = 0;
+    };
+
     struct DTCommandFence : RenderCommandFence {
         DeviceThread *thread = nullptr;
         RenderCommandFence *inner = nullptr;
+        std::shared_ptr<DTFenceState> state = std::make_shared<DTFenceState>();
 
         DTCommandFence(DeviceThread *thread, std::unique_ptr<RenderCommandFence> inner) : thread(thread), inner(inner.release()) { }
         ~DTCommandFence() override { destroyAsync(thread, inner); }
@@ -1256,7 +1297,25 @@ namespace plume {
                 readbacks.insert(readbacks.end(), commandList->recordedReadbacks.begin(), commandList->recordedReadbacks.end());
             }
 
-            thread->runAsync([queue = inner, executions = std::move(executions), readbacks, waits = unwrap(waitSemaphores, waitSemaphoreCount), signals = unwrap(signalSemaphores, signalSemaphoreCount), fence = unwrap(signalFence)]() mutable {
+            // What the upload buffers left mapped hold now goes to the backend's before the lists, as at a submission.
+            {
+                std::scoped_lock lock(mappedUploadsMutex);
+                for (DTBuffer *buffer : mappedUploads) {
+                    thread->runAsync([inner = buffer->inner, bytes = std::vector<uint8_t>(buffer->uploadCopy.get(), buffer->uploadCopy.get() + buffer->size)]() {
+                        memcpy(inner->map(0, nullptr), bytes.data(), bytes.size());
+                    });
+                }
+            }
+
+            std::shared_ptr<DTFenceState> fenceState;
+            uint64_t fenceSerial = 0;
+            if (signalFence != nullptr) {
+                fenceState = static_cast<DTCommandFence *>(signalFence)->state;
+                std::scoped_lock lock(fenceState->mutex);
+                fenceSerial = ++fenceState->queued;
+            }
+
+            thread->runAsync([queue = inner, executions = std::move(executions), readbacks, waits = unwrap(waitSemaphores, waitSemaphoreCount), signals = unwrap(signalSemaphores, signalSemaphoreCount), fence = unwrap(signalFence), fenceState, fenceSerial]() mutable {
                 // A buffer that was mapped when its last data arrived, and that the caller never mapped and unmapped.
                 for (const std::shared_ptr<DTMapState> &state : readbacks) {
                     state->unmap(0, nullptr);
@@ -1269,6 +1328,15 @@ namespace plume {
                 }
 
                 queue->executeCommandLists(innerLists.data(), uint32_t(innerLists.size()), waits.data(), uint32_t(waits.size()), signals.data(), uint32_t(signals.size()), fence);
+                if (fenceState != nullptr) {
+                    {
+                        std::scoped_lock lock(fenceState->mutex);
+                        fenceState->replayed = std::max(fenceState->replayed, fenceSerial);
+                    }
+
+                    fenceState->replayedCondition.notify_all();
+                }
+
                 for (const std::shared_ptr<DTMapState> &state : readbacks) {
                     state->replayed++;
                     if (std::find(pendingReadbacks.begin(), pendingReadbacks.end(), state) == pendingReadbacks.end()) {
@@ -1290,8 +1358,24 @@ namespace plume {
             }
         }
 
+        // Waits for the device thread to replay the executions that signal the fence up to the last wait for it, not the
+        // one just queued: so a caller records its next list while the device thread replays its last, one execution in
+        // flight. What a wait made safe to reuse is safe either way: a command list records anew at once, an upload
+        // buffer's memory is the caller's own (DTBuffer::map()), a READBACK buffer's map() waits for its own data,
+        // objects are deleted only after the lists that recorded them, and the backend's fences are no-ops (WebGPU's).
+        // RT64 waited after each list, and each wait was a trip to the page's thread behind everything queued: on a
+        // phone, 5.5-6.7 ms of each of its interpolated frames, and 9% of its display list thread's time.
         void waitForCommandFence(RenderCommandFence *fence) override {
-            runSync(thread, [&]() { inner->waitForCommandFence(unwrap(fence)); });
+            if ((fence == nullptr) || thread->isCurrent()) {
+                runSync(thread, [&]() { inner->waitForCommandFence(unwrap(fence)); });
+                return;
+            }
+
+            DTFenceState &state = *static_cast<DTCommandFence *>(fence)->state;
+            std::unique_lock lock(state.mutex);
+            const uint64_t target = state.waited;
+            state.replayedCondition.wait(lock, [&]() { return state.replayed >= target; });
+            state.waited = state.queued;
         }
     };
 
@@ -1319,7 +1403,7 @@ namespace plume {
 
         std::unique_ptr<RenderBuffer> createBuffer(const RenderBufferDesc &desc) override {
             std::unique_ptr<RenderBuffer> buffer = runSync(thread, [&]() { return inner->createBuffer(desc); });
-            return buffer ? std::make_unique<DTBuffer>(thread, std::move(buffer), desc.heapType) : nullptr;
+            return buffer ? std::make_unique<DTBuffer>(thread, std::move(buffer), desc) : nullptr;
         }
 
         std::unique_ptr<RenderTexture> createTexture(const RenderTextureDesc &desc) override {
@@ -1404,7 +1488,7 @@ namespace plume {
 
         std::unique_ptr<RenderBuffer> createBuffer(const RenderBufferDesc &desc) override {
             std::unique_ptr<RenderBuffer> buffer = runSync(thread, [&]() { return inner->createBuffer(desc); });
-            return buffer ? std::make_unique<DTBuffer>(thread, std::move(buffer), desc.heapType) : nullptr;
+            return buffer ? std::make_unique<DTBuffer>(thread, std::move(buffer), desc) : nullptr;
         }
 
         std::unique_ptr<RenderTexture> createTexture(const RenderTextureDesc &desc) override {

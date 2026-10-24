@@ -14,9 +14,10 @@
 //   caller waits. map() of a buffer whose data the backend delivers asynchronously waits on the calling side until
 //   isMapReady(), so the device thread keeps returning to its event loop meanwhile, and so does
 //   createGraphicsPipeline() for a pipeline the backend builds asynchronously, until its isReady().
-// - createTexture() and an upload buffer's map() after its first don't wait: the texture is made on the device thread
-//   after whatever is queued before, and a caller that needs its backend object first (recording it in a command list)
-//   waits then; the buffer is mapped at the address its first map() returned, and the backend's map() is queued.
+// - createTexture() and an upload buffer's map() don't wait: the texture is made on the device thread after whatever
+//   is queued before, and a caller that needs its backend object first (recording it in a command list) waits then; an
+//   upload buffer is mapped at memory of its own on the calling side, and unmap() queues a copy of what was written
+//   for the backend's buffer (and an execution one of each buffer left mapped), so the caller can write again at once.
 // - A READBACK buffer's isMapReady() doesn't wait for the device thread: after a copy into the buffer is replayed, the
 //   device thread checks it at each replay and present until the data is there, maps it and publishes the answer,
 //   which isMapReady() reads. Its map() waits for that answer, not behind everything queued on the device thread.
@@ -29,8 +30,10 @@
 //   something by the delete has been executed, begun again or deleted: a list never replays without an object it
 //   recorded, or submits a texture already destroyed (WebGPU drops that command buffer). A game's hi-res texture pack
 //   reloading a texture during a frame did that.
-// - waitForCommandFence() waits for the device thread to run everything queued before it, then for the fence. On a
-//   backend whose fences are no-ops (WebGPU's), that is what makes it safe to reuse what the GPU work used.
+// - waitForCommandFence() waits for the device thread to replay the executions that signal the fence up to the last
+//   wait for it, not the one just queued, so a caller records its next list while the device thread replays its last.
+//   That is enough on a backend whose fences are no-ops (WebGPU's): a command list, an upload buffer's memory and a
+//   READBACK buffer are safe to reuse without it (above), and an object is deleted only after the lists that used it.
 // - A swap chain hands out textures of its own, and present() copies the one drawn into the backend's swap chain
 //   texture: acquire, copy and present run as one task on the device thread. A browser shows the canvas between two
 //   tasks of its event loop whenever it updates the rendering, so a canvas texture acquired in one task can be gone
